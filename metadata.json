@@ -1,0 +1,6 @@
+{
+  "name": "Северный Курьер: Аномальная Тайга",
+  "description": "Пиксельная игра про исследование заснеженной тайги в духе Death Stranding: доставка грузов с физикой равновесия, динамическая погода, крафтинг экипировки и задания исследователей.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
