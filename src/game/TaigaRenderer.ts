@@ -17,6 +17,10 @@ import { getSpruceSprites } from './SpruceSprite';
 export class TaigaRenderer {
   private canvas: HTMLCanvasElement;
   private ctx: CanvasRenderingContext2D;
+  // Lazily-loaded PNG tile assets (AI-generated), keyed by public path.
+  // Falls back to the legacy procedural fillRect drawing until each image
+  // finishes loading, so there is never a blank frame.
+  private tileImageCache: Map<string, HTMLImageElement> = new Map();
 
   constructor(canvas: HTMLCanvasElement) {
     this.canvas = canvas;
@@ -24,6 +28,16 @@ export class TaigaRenderer {
     if (!context) throw new Error('Could not get canvas context');
     this.ctx = context;
     this.ctx.imageSmoothingEnabled = false;
+  }
+
+  private getTileImage(src: string): HTMLImageElement {
+    let img = this.tileImageCache.get(src);
+    if (!img) {
+      img = new Image();
+      img.src = src;
+      this.tileImageCache.set(src, img);
+    }
+    return img;
   }
 
   private zoom: number = 1.0;
@@ -635,24 +649,23 @@ export class TaigaRenderer {
       }
 
       case 'STATION_PLATFORM': {
-        // Heavy Siberian timber duckboards & decking
-        ctx.fillStyle = '#3E2A1C';
-        ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+        // AI-generated log wall tile (see /public/tiles/station_platform_wall.png).
+        // Falls back to the old flat plank fillRect while the image loads.
+        const wallImg = this.getTileImage('tiles/station_platform_wall.png');
+        if (wallImg.complete && wallImg.naturalWidth > 0) {
+          ctx.drawImage(wallImg, x, y, TILE_SIZE, TILE_SIZE);
+        } else {
+          ctx.fillStyle = '#3E2A1C';
+          ctx.fillRect(x, y, TILE_SIZE, TILE_SIZE);
+          ctx.fillStyle = '#684A33';
+          ctx.fillRect(x + 2, y + 2, TILE_SIZE - 4, 5);
+          ctx.fillRect(x + 2, y + 9, TILE_SIZE - 4, 5);
+          ctx.fillRect(x + 2, y + 16, TILE_SIZE - 4, 5);
+          ctx.fillRect(x + 2, y + 23, TILE_SIZE - 4, 5);
+        }
 
-        // Weathered pine timber planks
-        ctx.fillStyle = '#684A33';
-        ctx.fillRect(x + 2, y + 2, TILE_SIZE - 4, 5);
-        ctx.fillRect(x + 2, y + 9, TILE_SIZE - 4, 5);
-        ctx.fillRect(x + 2, y + 16, TILE_SIZE - 4, 5);
-        ctx.fillRect(x + 2, y + 23, TILE_SIZE - 4, 5);
-
-        // Wood grain highlights
-        ctx.fillStyle = '#8A6649';
-        ctx.fillRect(x + 4, y + 3, 14, 2);
-        ctx.fillRect(x + 6, y + 10, 13, 2);
-        ctx.fillRect(x + 5, y + 17, 15, 2);
-
-        // Forged iron rivets & frost rime
+        // Forged iron rivets & frost rime (kept as an overlay for now, will be
+        // baked into future tile generations instead of drawn separately)
         ctx.fillStyle = '#1C1917';
         ctx.fillRect(x + 3, y + 4, 2, 2);
         ctx.fillRect(x + TILE_SIZE - 5, y + 4, 2, 2);
@@ -1122,115 +1135,54 @@ export class TaigaRenderer {
     time: number,
     zoom: number = 1.0
   ) {
+    // AI-generated cabin sprite, used exactly as Retro Diffusion produced it (full
+    // scene: cabin, firewood, snow and foreground bits included), 96x128 native,
+    // anchored at bottom-center = (sx, sy). Antenna tip sits at local (21, 8),
+    // offset (-27, -120) from the anchor -- used below to place the beacon light
+    // and uplink beam.
+    const cabinImg = this.getTileImage('structures/station_cabin.png');
+    const CABIN_W = 96;
+    const CABIN_H = 128;
+    const ANTENNA_OFFSET_X = -27;
+    const ANTENNA_OFFSET_Y = -120;
+
     STATIONS.forEach(st => {
       const sx = st.x * TILE_SIZE - cameraX;
       const sy = st.y * TILE_SIZE - cameraY;
       if (sx < -120 || sx > width + 120 || sy < -120 || sy > height + 120) return;
 
       ctx.save();
-      // Ground shadow beneath outpost
-      ctx.fillStyle = 'rgba(15, 23, 34, 0.45)';
+      // Ground contact shadow beneath outpost (soft radial falloff via a squashed
+      // transform, not a hard-edged fill, otherwise it reads as a dark pit cut into
+      // the platform instead of a shadow cast by the building)
+      ctx.save();
+      ctx.translate(sx, sy + 4);
+      ctx.scale(1, 7 / 30);
+      const shadowGrad = ctx.createRadialGradient(0, 0, 0, 0, 0, 30);
+      shadowGrad.addColorStop(0, 'rgba(10, 14, 20, 0.38)');
+      shadowGrad.addColorStop(0.7, 'rgba(10, 14, 20, 0.18)');
+      shadowGrad.addColorStop(1, 'rgba(10, 14, 20, 0)');
+      ctx.fillStyle = shadowGrad;
       ctx.beginPath();
-      ctx.ellipse(sx, sy + 18, 38, 12, 0, 0, Math.PI * 2);
+      ctx.arc(0, 0, 30, 0, Math.PI * 2);
       ctx.fill();
+      ctx.restore();
 
-      // Station cabin body: Insulated polar expedition bunker / heavy timber base
-      ctx.fillStyle = '#1E2836'; // Dark foundation
-      ctx.fillRect(sx - 32, sy - 20, 64, 36);
-      ctx.fillStyle = '#2B394A'; // Outer insulated cladding
-      ctx.fillRect(sx - 30, sy - 18, 60, 32);
+      if (cabinImg.complete && cabinImg.naturalWidth > 0) {
+        ctx.drawImage(cabinImg, sx - CABIN_W / 2, sy - CABIN_H, CABIN_W, CABIN_H);
+      } else {
+        // Fallback flat placeholder while the image loads
+        ctx.fillStyle = '#2B394A';
+        ctx.fillRect(sx - 30, sy - 50, 60, 40);
+      }
 
-      // Horizontal timber/panel grooves
-      ctx.fillStyle = '#19222D';
-      ctx.fillRect(sx - 30, sy - 10, 60, 2);
-      ctx.fillRect(sx - 30, sy - 2, 60, 2);
-      ctx.fillRect(sx - 30, sy + 6, 60, 2);
-
-      // Sloped polar roof with thick snow pillow mantle (Ref Screenshot 2 & 3)
-      ctx.fillStyle = '#1A232E'; // Roof overhang structure
-      ctx.beginPath();
-      ctx.moveTo(sx - 36, sy - 20);
-      ctx.lineTo(sx, sy - 38);
-      ctx.lineTo(sx + 36, sy - 20);
-      ctx.closePath();
-      ctx.fill();
-
-      // Deep snow pillow covering the roof
-      ctx.fillStyle = '#8FA6BC'; // Snow underside shadow
-      ctx.beginPath();
-      ctx.moveTo(sx - 37, sy - 21);
-      ctx.lineTo(sx, sy - 40);
-      ctx.lineTo(sx + 37, sy - 21);
-      ctx.lineTo(sx + 35, sy - 26);
-      ctx.lineTo(sx, sy - 45);
-      ctx.lineTo(sx - 35, sy - 26);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.fillStyle = '#D6E6F4'; // Midtone snow
-      ctx.beginPath();
-      ctx.moveTo(sx - 35, sy - 24);
-      ctx.lineTo(sx, sy - 43);
-      ctx.lineTo(sx + 35, sy - 24);
-      ctx.lineTo(sx + 33, sy - 28);
-      ctx.lineTo(sx, sy - 47);
-      ctx.lineTo(sx - 33, sy - 28);
-      ctx.closePath();
-      ctx.fill();
-
-      ctx.fillStyle = '#FFFFFF'; // Sunlit snow crest
-      ctx.beginPath();
-      ctx.moveTo(sx - 33, sy - 27);
-      ctx.lineTo(sx, sy - 46);
-      ctx.lineTo(sx + 33, sy - 27);
-      ctx.lineTo(sx + 31, sy - 30);
-      ctx.lineTo(sx, sy - 49);
-      ctx.lineTo(sx - 31, sy - 30);
-      ctx.closePath();
-      ctx.fill();
-
-      // Reinforced airtight polar airlock door
-      ctx.fillStyle = '#D97706'; // Warning orange door frame
-      ctx.fillRect(sx - 8, sy - 2, 16, 16);
-      ctx.fillStyle = '#1C1917';
-      ctx.fillRect(sx - 6, sy, 12, 14);
-      ctx.fillStyle = '#F59E0B'; // Small door porthole
-      ctx.fillRect(sx - 2, sy + 2, 4, 4);
-
-      // Warm glowing triple-pane windows with interior firelight (Ref Screenshot 2)
-      const flicker = Math.sin(time * 0.008) * 0.08 + 0.92;
-      // Left window
-      ctx.fillStyle = '#1A212B';
-      ctx.fillRect(sx - 25, sy - 14, 12, 10);
-      ctx.fillStyle = `rgba(251, 191, 36, ${flicker})`;
-      ctx.fillRect(sx - 24, sy - 13, 10, 8);
-      ctx.fillStyle = '#FEF08A';
-      ctx.fillRect(sx - 22, sy - 11, 6, 4);
-
-      // Right window
-      ctx.fillStyle = '#1A212B';
-      ctx.fillRect(sx + 13, sy - 14, 12, 10);
-      ctx.fillStyle = `rgba(251, 191, 36, ${flicker})`;
-      ctx.fillRect(sx + 14, sy - 13, 10, 8);
-      ctx.fillStyle = '#FEF08A';
-      ctx.fillRect(sx + 16, sy - 11, 6, 4);
-
-      // Tall communications & weather mast
-      ctx.strokeStyle = '#94A3B8';
-      ctx.lineWidth = 2;
-      ctx.beginPath();
-      ctx.moveTo(sx + 24, sy - 24);
-      ctx.lineTo(sx + 24, sy - 58);
-      ctx.lineTo(sx + 18, sy - 50);
-      ctx.moveTo(sx + 24, sy - 58);
-      ctx.lineTo(sx + 30, sy - 50);
-      ctx.stroke();
-
-      // Flashing red obstruction beacon
+      // Flashing red obstruction beacon on the antenna tip
+      const beaconX = sx + ANTENNA_OFFSET_X;
+      const beaconY = sy + ANTENNA_OFFSET_Y;
       const blink = Math.sin(time * 0.007) > 0.1;
       ctx.fillStyle = blink ? '#EF4444' : '#581C1C';
       ctx.beginPath();
-      ctx.arc(sx + 24, sy - 60, 3, 0, Math.PI * 2);
+      ctx.arc(beaconX, beaconY, 2, 0, Math.PI * 2);
       ctx.fill();
 
       // Chiral Network Uplink Beam if connected
@@ -1238,71 +1190,29 @@ export class TaigaRenderer {
         ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(sx + 24, sy - 60);
-        ctx.lineTo(sx + 24, sy - 180);
+        ctx.moveTo(beaconX, beaconY);
+        ctx.lineTo(beaconX, beaconY - 120);
         ctx.stroke();
       }
 
       // Station Callsign Plate
       ctx.fillStyle = '#0B111A';
-      ctx.fillRect(sx - 34, sy + 18, 68, 14);
+      ctx.fillRect(sx - 34, sy + 10, 68, 14);
       ctx.strokeStyle = '#38BDF8';
       ctx.lineWidth = 1;
-      ctx.strokeRect(sx - 34, sy + 18, 68, 14);
+      ctx.strokeRect(sx - 34, sy + 10, 68, 14);
       ctx.fillStyle = '#E0F2FE';
       ctx.font = 'bold 9px "Share Tech Mono", monospace';
       ctx.textAlign = 'center';
-      ctx.fillText(st.callsign, sx, sy + 28);
+      ctx.fillText(st.callsign, sx, sy + 20);
 
       // Progressive LOD for Stations
       if (zoom >= 1.25) {
-        // Icicles hanging along cabin roof eaves
-        ctx.fillStyle = '#BAE6FD';
-        ctx.fillRect(sx - 30, sy - 18, 2, 6);
-        ctx.fillRect(sx - 18, sy - 18, 2, 4);
-        ctx.fillRect(sx + 15, sy - 18, 2, 5);
-        ctx.fillRect(sx + 28, sy - 18, 2, 7);
-        ctx.fillStyle = '#FFFFFF';
-        ctx.fillRect(sx - 30, sy - 18, 1, 4);
-        ctx.fillRect(sx + 28, sy - 18, 1, 5);
-
-        // Heavy steel corner brackets with bolts
-        ctx.fillStyle = '#0F172A';
-        ctx.fillRect(sx - 32, sy - 18, 3, 4);
-        ctx.fillRect(sx + 29, sy - 18, 3, 4);
-        ctx.fillRect(sx - 32, sy + 10, 3, 4);
-        ctx.fillRect(sx + 29, sy + 10, 3, 4);
-        ctx.fillStyle = '#94A3B8';
-        ctx.fillRect(sx - 31, sy - 17, 1, 1);
-        ctx.fillRect(sx + 30, sy - 17, 1, 1);
-
-        // Guy-wire antenna supports
-        ctx.strokeStyle = 'rgba(148, 163, 184, 0.6)';
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(sx + 24, sy - 52);
-        ctx.lineTo(sx + 8, sy - 20);
-        ctx.moveTo(sx + 24, sy - 52);
-        ctx.lineTo(sx + 38, sy - 20);
-        ctx.stroke();
-
         // Technical warning stencil
         ctx.fillStyle = '#F59E0B';
         ctx.font = '7px "Share Tech Mono", monospace';
         ctx.textAlign = 'center';
-        ctx.fillText('ГОСТ-СЕВЕР [УЗЕЛ]', sx, sy - 3);
-
-        if (zoom >= 1.7) {
-          // Cozy window interior silhouettes: thermos kettle steam wisp & radio receiver dials
-          ctx.fillStyle = 'rgba(254, 240, 138, 0.85)';
-          ctx.fillRect(sx - 20, sy - 10, 3, 4); // Radio receiver
-          ctx.fillRect(sx + 18, sy - 10, 2, 5); // Thermos
-          // Window frost frame
-          ctx.strokeStyle = 'rgba(255, 255, 255, 0.7)';
-          ctx.lineWidth = 1;
-          ctx.strokeRect(sx - 24, sy - 13, 10, 8);
-          ctx.strokeRect(sx + 14, sy - 13, 10, 8);
-        }
+        ctx.fillText('ГОСТ-СЕВЕР [УЗЕЛ]', sx, sy - CABIN_H + 14);
       }
 
       ctx.restore();
