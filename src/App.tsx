@@ -32,6 +32,8 @@ import { NPCDialogModal } from './components/NPCDialogModal';
 import { getRegionAt, getEntriesForRegion } from './utils/journalData';
 import { RegionDefinition } from './types/journal';
 import { Compass, Sparkles } from 'lucide-react';
+import { usePlatform } from './platform';
+import { SaveState, CURRENT_SAVE_VERSION } from './platform/types';
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -141,6 +143,65 @@ export default function App() {
     likes: number;
   } | null>(null);
   const [isGameOver] = useState(false);
+
+  // Platform layer (Telegram / VK / MAX / standalone) — save/load
+  const platform = usePlatform();
+
+  const buildSaveState = useCallback((): SaveState => ({
+    version: CURRENT_SAVE_VERSION,
+    savedAt: Date.now(),
+    player,
+    cargo,
+    tools,
+    resources,
+    equippedGear,
+    structures,
+    missions,
+    activeMissionId: activeMission?.id ?? null,
+    discoveredRegionIds,
+  }), [player, cargo, tools, resources, equippedGear, structures, missions, activeMission, discoveredRegionIds]);
+
+  const applySaveState = useCallback((s: SaveState) => {
+    setPlayer(s.player);
+    setCargo(s.cargo);
+    setTools(s.tools);
+    setResources(s.resources);
+    setEquippedGear(s.equippedGear);
+    setStructures(s.structures);
+    setMissions(s.missions);
+    setActiveMission(s.missions.find(m => m.id === s.activeMissionId) ?? null);
+    setDiscoveredRegionIds(s.discoveredRegionIds);
+  }, []);
+
+  // `player` changes every frame, so keep the latest snapshot builder in a ref —
+  // putting buildSaveState in the interval's deps would reset it before it ever fires
+  const buildSaveStateRef = useRef(buildSaveState);
+  buildSaveStateRef.current = buildSaveState;
+  // Don't autosave until the stored game has been loaded, or a fresh start would overwrite it
+  const saveLoadedRef = useRef(false);
+
+  // Load saved progress once, on mount
+  useEffect(() => {
+    platform.load()
+      .then(saved => { if (saved) applySaveState(saved); })
+      .finally(() => { saveLoadedRef.current = true; });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Autosave every 15s — Telegram/VK mini apps have no reliable "quit" hook,
+  // so periodic autosave is safer than save-on-unmount. Also flush when the app is hidden.
+  useEffect(() => {
+    const save = () => {
+      if (saveLoadedRef.current) platform.save(buildSaveStateRef.current());
+    };
+    const onVisibility = () => { if (document.visibilityState === 'hidden') save(); };
+    const id = setInterval(save, 15000);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      clearInterval(id);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
+  }, [platform]);
 
   // Input vector from joystick / keyboard / canvas
   const inputVectorRef = useRef({ x: 0, y: 0 });
