@@ -81,6 +81,30 @@ export interface AnomalyEntity {
   state: 'PATROLLING' | 'ALERT' | 'HUNTING';
   driftAngle: number;
   pulseTimer: number;
+  // Сюжетная аномалия: её поведение считается всегда, даже вдали от игрока
+  // (см. src/game/activityZone.ts). Обычным аномалиям ставить не нужно.
+  alwaysActive?: boolean;
+  // Служебное поле: игровое время (в секундах), когда аномалию последний раз
+  // полноценно обновляли. Нужно, чтобы «догнать» её поведение, когда игрок вернётся.
+  lastSimulatedAt?: number;
+}
+
+// Потерянный груз, лежащий в тайге.
+export interface LostCache {
+  id: string;
+  x: number;
+  y: number;
+  name: string;
+  weightKg: number;
+  category: string;
+}
+
+// Атмосферный ориентир (памятник, мост, вышка). Пока только справочная информация.
+export interface Landmark {
+  x: number;
+  y: number;
+  name: string;
+  icon: string;
 }
 
 export interface Footstep {

@@ -23,7 +23,7 @@ import {
 } from 'lucide-react';
 import { STATIONS } from '../utils/constants';
 import { ExplorersJournalView } from './ExplorersJournalView';
-import { JOURNAL_ENTRIES } from '../utils/journalData';
+import { JournalEntry } from '../types/journal';
 
 interface DeliveryPDAProps {
   initialTab?: 'MAP' | 'MISSIONS' | 'NETWORK' | 'JOURNAL' | 'HANDBOOK';
@@ -33,6 +33,7 @@ interface DeliveryPDAProps {
   structures: PlacedStructure[];
   activeMission: DeliveryMission | null;
   discoveredRegionIds?: string[];
+  journalEntries: JournalEntry[]; // записи дневника из уже загруженных регионов
   onAcceptMission: (missionId: string) => void;
   onClose: () => void;
 }
@@ -45,6 +46,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
   structures,
   activeMission,
   discoveredRegionIds = ['region_basin'],
+  journalEntries,
   onAcceptMission,
   onClose
 }) => {
@@ -54,7 +56,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
   const networkPercent = Math.round((connectedCount / stations.length) * 100);
 
   const regionSet = new Set(discoveredRegionIds);
-  const unlockedLoreCount = JOURNAL_ENTRIES.filter(e => regionSet.has(e.regionId)).length;
+  const unlockedLoreCount = journalEntries.filter(e => regionSet.has(e.regionId)).length;
 
   return (
     <div className="fixed inset-0 bg-neutral-950/80 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-6 select-none animate-in fade-in duration-200">
@@ -141,7 +143,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
             <Compass className="w-3.5 h-3.5 text-emerald-400" />
             <span>ДНЕВНИК ИССЛЕДОВАТЕЛЯ</span>
             <span className="text-[10px] px-1.5 py-0.2 rounded bg-neutral-900 text-emerald-400 border border-emerald-700/60 font-mono">
-              {unlockedLoreCount}/{JOURNAL_ENTRIES.length}
+              {unlockedLoreCount}/{journalEntries.length}
             </span>
           </button>
 
@@ -566,6 +568,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
             <ExplorersJournalView
               player={player}
               discoveredRegionIds={discoveredRegionIds}
+              journalEntries={journalEntries}
               onSwitchToMapTab={() => setActiveTab('MAP')}
             />
           )}

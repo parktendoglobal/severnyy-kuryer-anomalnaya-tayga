@@ -1,4 +1,21 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+/**
+ * ГЛАВНЫЙ ФАЙЛ ИГРЫ — «дирижёр»
+ *
+ * Здесь всё собирается вместе: игровой цикл (60 кадров в секунду), который двигает курьера,
+ * аномалии и погоду и просит холст нарисовать кадр; обработка нажатий (сбор ресурсов, крафт,
+ * задания, торговля, доставка); подгрузка регионов по мере путешествия; сохранения; и все
+ * окна интерфейса поверх холста.
+ *
+ * Сами формулы вынесены в отдельные файлы папки src/game/: движение и выживание курьера —
+ * playerPhysics.ts, погода — weather.ts, поведение аномалий — anomalyAI.ts, зона
+ * активности — activityZone.ts, сохранения — saveSystem.ts.
+ *
+ * ВАЖНО ПРО СКОРОСТЬ. Всё, что меняется каждый кадр (позиция курьера, аномалии, погода),
+ * хранится в «ящиках» useRef — их изменение не заставляет React перерисовывать интерфейс.
+ * Интерфейс (useState) обновляется только когда что-то видимое правда поменялось:
+ * открылось окно, изменился инвентарь, или раз в 0.1 секунды для полосок HUD.
+ */
+import { useState, useEffect, useLayoutEffect, useRef, useCallback, useMemo } from 'react';
 import {
   PlayerStats,
   CargoItem,
@@ -14,12 +31,33 @@ import {
   ResourceItem,
   EquippedGear,
   CraftingRecipe,
-  TradeItem
+  TradeItem,
+  LostCache
 } from './types/game';
+import { JournalEntry, RegionDefinition } from './types/journal';
 import { STATIONS, INITIAL_TOOLS, INITIAL_MISSIONS, MAP_COLS, MAP_ROWS } from './utils/constants';
 import { generateWorld } from './utils/mapGenerator';
 import { INITIAL_PLAYER_RESOURCES, ALL_RESOURCES } from './utils/craftingData';
 import { TaigaRenderer } from './game/TaigaRenderer';
+import { stepPlayer, computeCarriedWeightKg, PlayerStepTimers } from './game/playerPhysics';
+import { INITIAL_WEATHER, tickWeather } from './game/weather';
+import { updateAnomaly, wakeUpIfDormant } from './game/anomalyAI';
+import { getActivityRadius, shouldSimulate } from './game/activityZone';
+import { HUD_REFRESH_INTERVAL_SEC, playerHudKey } from './game/hudSync';
+import {
+  loadGame,
+  saveGame,
+  deleteSave,
+  restorePlayer,
+  applySavedQuests,
+  collectQuestStates,
+  SaveData,
+  NPCRelation,
+  SAVE_VERSION,
+  AUTOSAVE_INTERVAL_MS
+} from './game/saveSystem';
+import { REGIONS, getRegionAt } from './content/regionMap';
+import { loadRegion, regionsNearPoint } from './content/regionLoader';
 import { sound } from './utils/audio';
 import { VirtualControls } from './components/VirtualControls';
 import { GameHUD } from './components/GameHUD';
@@ -29,109 +67,214 @@ import { StationTerminalModal } from './components/StationTerminalModal';
 import { DeliveryReportModal } from './components/DeliveryReportModal';
 import { CraftingModal } from './components/CraftingModal';
 import { NPCDialogModal } from './components/NPCDialogModal';
-import { getRegionAt, getEntriesForRegion } from './utils/journalData';
-import { RegionDefinition } from './types/journal';
-import { Compass, Sparkles } from 'lucide-react';
+import { GameMenuModal } from './components/GameMenuModal';
+import { Compass, Sparkles, Save } from 'lucide-react';
+
+// Показатели курьера в начале новой игры: стоит у базы «Кедр-1», всё на 100%.
+const NEW_GAME_PLAYER: PlayerStats = {
+  x: 18,
+  y: 22,
+  vx: 0,
+  vy: 0,
+  facingAngle: 0,
+  balance: 0,
+  stumbleAlert: 'NONE',
+  stumbleTimer: 0,
+  isStumbling: false,
+  isBracingLeft: false,
+  isBracingRight: false,
+  stamina: 100,
+  maxStamina: 100,
+  warmth: 100,
+  battery: 100,
+  bootsIntegrity: 100,
+  isHoldingBreath: false,
+  breathAir: 100,
+  isCrouching: false,
+  scannerCooldown: 0,
+  scannerPulseProgress: 1.0,
+  scannerActive: false,
+  isSprinting: false,
+  onSled: false,
+  courierGrade: 'Курьер Снабжения 1-го класса',
+  totalLikes: 250,
+  deliveredDeliveries: 0
+};
+
+// На каком расстоянии (в клетках) можно взаимодействовать с объектами.
+const STATION_INTERACT_RADIUS = 2.8;
+const NPC_INTERACT_RADIUS = 3.2;
+const RESOURCE_INTERACT_RADIUS = 2.5;
+const STATION_ARRIVAL_RADIUS = 2.5; // подойдя так близко к цели заказа, терминал откроется сам
+const QUEST_SCAN_RADIUS = 5.0; // исследовательское задание засчитывается сканом ближе этого
+
+// Масштаб камеры: от 0.65 (далеко) до 2.5 (близко).
+const MIN_ZOOM = 0.65;
+const MAX_ZOOM = 2.5;
+const clampZoom = (z: number) => Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Math.round(z * 100) / 100));
+
+/**
+ * Начальное состояние игры: из сохранения, если оно есть, иначе — новая игра.
+ * Вызывается один раз при запуске.
+ */
+function createInitialState(saved: SaveData | null) {
+  const missions = INITIAL_MISSIONS.map(m =>
+    saved?.missionStatuses[m.id] ? { ...m, status: saved.missionStatuses[m.id] } : m
+  );
+  return {
+    player: saved ? restorePlayer(saved.player) : NEW_GAME_PLAYER,
+    stations: STATIONS.map(s => (saved?.connectedStationIds.includes(s.id) ? { ...s, connected: true } : s)),
+    missions,
+    // В новой игре первый заказ уже выдан курьеру.
+    activeMission: saved
+      ? missions.find(m => m.id === saved.activeMissionId) ?? null
+      : INITIAL_MISSIONS[0],
+    cargo: saved ? saved.cargo : INITIAL_MISSIONS[0].cargoItems,
+    tools: saved ? saved.tools : INITIAL_TOOLS,
+    resources: saved ? saved.resources : INITIAL_PLAYER_RESOURCES,
+    equippedGear: saved ? saved.equippedGear : {},
+    structures: saved ? saved.structures : [],
+    discoveredRegionIds: saved ? saved.discoveredRegionIds : ['region_basin'],
+    npcRelations: saved ? saved.npcRelations : {},
+    missionStartTime: Date.now() - (saved ? saved.missionElapsedSec * 1000 : 0)
+  };
+}
+
+// Порядок регионов в дневнике — как в списке REGIONS, а не в порядке загрузки.
+const regionOrder = (regionId: string) => REGIONS.findIndex(r => r.id === regionId);
 
 export default function App() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rendererRef = useRef<TaigaRenderer | null>(null);
 
-  // Sound state
+  // ======================================================================
+  // ЗАГРУЗКА СОХРАНЕНИЯ (один раз при запуске)
+  // ======================================================================
+  const [boot] = useState(() => loadGame());
+  const [initial] = useState(() => createInitialState(boot.kind === 'ok' ? boot.data : null));
+
+  // Сообщение игроку о состоянии сохранения (обновлено, повреждено, от новой версии…).
+  const [saveNotice, setSaveNotice] = useState<string | null>(() => {
+    if (boot.kind === 'ok' && boot.migratedFrom !== null) {
+      return `Сохранение обновлено с формата версии ${boot.migratedFrom} до ${SAVE_VERSION}. Весь прогресс на месте.`;
+    }
+    if (boot.kind === 'newer') {
+      return `Сохранение сделано более новой версией игры (формат ${boot.version}). Чтобы не испортить его, эта версия ничего не сохраняет. Обновите страницу игры или начните заново через меню.`;
+    }
+    if (boot.kind === 'broken') {
+      return `Сохранение повреждено и не читается, поэтому начата новая игра. Копия старого сохранения не удалена, она лежит в памяти браузера под именем «${boot.backupKey}».`;
+    }
+    return null;
+  });
+  // Сохранение от более новой версии игры не перезаписываем, пока игрок сам не начнёт заново.
+  const savingDisabledRef = useRef(boot.kind === 'newer');
+  const savingDisabledReason =
+    boot.kind === 'newer' ? 'Сохранение сделано более новой версией игры — эта версия его не перезаписывает.' : null;
+  const [lastSavedAt, setLastSavedAt] = useState<Date | null>(null);
+
+  // Звук
   const [isMuted, setIsMuted] = useState(false);
 
-  // Camera Zoom & Dynamic LOD Scale (0.65x to 2.5x)
+  // Масштаб камеры. zoomRef читает игровой цикл, zoom — ползунок в интерфейсе.
   const [zoom, setZoom] = useState<number>(1.0);
   const zoomRef = useRef<number>(1.0);
 
   const handleZoomChange = useCallback((newZoom: number) => {
-    const clamped = Math.max(0.65, Math.min(2.5, Math.round(newZoom * 100) / 100));
+    const clamped = clampZoom(newZoom);
     setZoom(clamped);
     zoomRef.current = clamped;
   }, []);
 
-  // World Data
-  const worldRef = useRef(generateWorld());
-  const [stations, setStations] = useState<Station[]>(STATIONS);
-  const [missions, setMissions] = useState<DeliveryMission[]>(INITIAL_MISSIONS);
-  const [structures, setStructures] = useState<PlacedStructure[]>([]);
-  const [anomalies, setAnomalies] = useState<AnomalyEntity[]>(worldRef.current.anomalies);
-  const [lostCaches, setLostCaches] = useState(worldRef.current.lostCaches);
-  const [resourceNodes, setResourceNodes] = useState<WorldResourceNode[]>(worldRef.current.resourceNodes);
-  const [npcs, setNpcs] = useState<WorldNPC[]>(worldRef.current.npcs);
+  // ======================================================================
+  // МИР
+  // ======================================================================
+  // Рельеф (снег, лёд, скалы, деревья) генерируется один раз при запуске по формулам.
+  const [world] = useState(generateWorld);
+  const [stations, setStations] = useState<Station[]>(initial.stations);
+  const [missions, setMissions] = useState<DeliveryMission[]>(initial.missions);
+  const [structures, setStructures] = useState<PlacedStructure[]>(initial.structures);
 
-  // Cargo, Tools, Resources & Equipped Gear
-  const [cargo, setCargo] = useState<CargoItem[]>(INITIAL_MISSIONS[0].cargoItems);
-  const [tools, setTools] = useState<ToolItem[]>(INITIAL_TOOLS);
-  const [resources, setResources] = useState<ResourceItem[]>(INITIAL_PLAYER_RESOURCES);
-  const [equippedGear, setEquippedGear] = useState<EquippedGear>({});
-  const [activeMission, setActiveMission] = useState<DeliveryMission | null>(INITIAL_MISSIONS[0]);
+  // Контент регионов. Пока регион не загружен, его жителей, ресурсов и записей здесь нет.
+  const [npcs, setNpcs] = useState<WorldNPC[]>([]);
+  const [resourceNodes, setResourceNodes] = useState<WorldResourceNode[]>([]);
+  const [lostCaches, setLostCaches] = useState<LostCache[]>([]);
+  const [journalEntries, setJournalEntries] = useState<JournalEntry[]>([]);
+  const loadedRegionIdsRef = useRef<Set<string>>(new Set());
 
-  // Player State
-  const [player, setPlayer] = useState<PlayerStats>({
-    x: 18,
-    y: 22,
-    vx: 0,
-    vy: 0,
-    facingAngle: 0,
-    balance: 0,
-    stumbleAlert: 'NONE',
-    stumbleTimer: 0,
-    isStumbling: false,
-    isBracingLeft: false,
-    isBracingRight: false,
-    stamina: 100,
-    maxStamina: 100,
-    warmth: 100,
-    battery: 100,
-    bootsIntegrity: 100,
-    isHoldingBreath: false,
-    breathAir: 100,
-    isCrouching: false,
-    scannerCooldown: 0,
-    scannerPulseProgress: 1.0,
-    scannerActive: false,
-    isSprinting: false,
-    onSled: false,
-    courierGrade: 'Курьер Снабжения 1-го класса',
-    totalLikes: 250,
-    deliveredDeliveries: 0
-  });
+  // Аномалии меняются каждый кадр, поэтому живут в ref, а не в state (см. комментарий вверху).
+  const anomaliesRef = useRef<AnomalyEntity[]>([]);
 
-  // Dynamic Weather State
-  const [weather, setWeather] = useState<WeatherState>({
-    type: 'CLEAR_FROST',
-    nameRu: 'Ясный мороз',
-    windX: 1,
-    windY: 0.5,
-    windSpeed: 3.5,
-    visibility: 0.95,
-    anomalyIntensity: 0.2,
-    tempCelsius: -22,
-    timeToChange: 40,
-    dangerLevel: 'LOW',
-    description: 'Чистое небо и морозный воздух. Стабильное сцепление.'
-  });
+  // Игровое время в секундах с момента запуска. Нужно, чтобы понимать, сколько «проспала»
+  // аномалия вдали от курьера.
+  const gameTimeRef = useRef(0);
 
-  // Footsteps & Snow Particles
+  // Прогресс из сохранения для регионов, которые ещё не загружены: применяется при их загрузке.
+  const savedQuestsRef = useRef<SaveData['quests']>(boot.kind === 'ok' ? boot.data.quests : {});
+  const harvestedIdsRef = useRef<Set<string>>(
+    new Set(boot.kind === 'ok' ? boot.data.harvestedResourceNodeIds : [])
+  );
+  const [npcRelations, setNpcRelations] = useState<Record<string, NPCRelation>>(initial.npcRelations);
+
+  // Груз, инструменты, ресурсы, снаряжение
+  const [cargo, setCargo] = useState<CargoItem[]>(initial.cargo);
+  const [tools, setTools] = useState<ToolItem[]>(initial.tools);
+  const [resources, setResources] = useState<ResourceItem[]>(initial.resources);
+  const [equippedGear, setEquippedGear] = useState<EquippedGear>(initial.equippedGear);
+  const [activeMission, setActiveMission] = useState<DeliveryMission | null>(initial.activeMission);
+
+  const totalWeightKg = useMemo(
+    () => computeCarriedWeightKg(cargo, tools, resources),
+    [cargo, tools, resources]
+  );
+
+  // ======================================================================
+  // КУРЬЕР
+  // playerRef — «живое» состояние, меняется 60 раз в секунду.
+  // hudPlayer — снимок для интерфейса, обновляется не чаще 10 раз в секунду.
+  // ======================================================================
+  const playerRef = useRef<PlayerStats>(initial.player);
+  const [hudPlayer, setHudPlayer] = useState<PlayerStats>(initial.player);
+  const hudKeyRef = useRef(playerHudKey(initial.player));
+
+  // Показать в интерфейсе текущее состояние курьера.
+  const syncHud = useCallback(() => {
+    hudKeyRef.current = playerHudKey(playerRef.current);
+    setHudPlayer(playerRef.current);
+  }, []);
+
+  // Изменить курьера по нажатию (лайки, лямки, термос…) и сразу показать это в интерфейсе.
+  const updatePlayer = useCallback(
+    (change: (prev: PlayerStats) => PlayerStats) => {
+      playerRef.current = change(playerRef.current);
+      syncHud();
+    },
+    [syncHud]
+  );
+
+  // Погода: weatherRef тикает каждый кадр, weather (для интерфейса) меняется только при смене погоды.
+  const weatherRef = useRef<WeatherState>(INITIAL_WEATHER);
+  const [weather, setWeather] = useState<WeatherState>(INITIAL_WEATHER);
+
+  // Следы и снежинки: только для отрисовки, в интерфейсе не участвуют.
   const footstepsRef = useRef<Footstep[]>([]);
-  const snowParticlesRef = useRef<
-    { x: number; y: number; speed: number; size: number }[]
-  >([]);
+  const snowParticlesRef = useRef<{ x: number; y: number; speed: number; size: number }[]>([]);
 
-  // Modals & UI overlays
+  // ======================================================================
+  // ОКНА ИНТЕРФЕЙСА
+  // ======================================================================
   const [pdaOpen, setPdaOpen] = useState(false);
   const [pdaInitialTab, setPdaInitialTab] = useState<
     'MAP' | 'MISSIONS' | 'NETWORK' | 'JOURNAL' | 'HANDBOOK'
   >('MAP');
-  const [discoveredRegionIds, setDiscoveredRegionIds] = useState<string[]>(['region_basin']);
+  const [discoveredRegionIds, setDiscoveredRegionIds] = useState<string[]>(initial.discoveredRegionIds);
   const [regionDiscoveryAlert, setRegionDiscoveryAlert] = useState<{
     region: RegionDefinition;
     unlockedCount: number;
   } | null>(null);
   const [cargoModalOpen, setCargoModalOpen] = useState(false);
   const [craftingModalOpen, setCraftingModalOpen] = useState(false);
-  const [dialogNPC, setDialogNPC] = useState<WorldNPC | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [dialogNpcId, setDialogNpcId] = useState<string | null>(null);
   const [stationModalStation, setStationModalStation] = useState<Station | null>(null);
   const [deliveryReport, setDeliveryReport] = useState<{
     mission: DeliveryMission;
@@ -140,40 +283,230 @@ export default function App() {
     grade: 'S' | 'A' | 'B' | 'C';
     likes: number;
   } | null>(null);
-  const [isGameOver] = useState(false);
 
-  // Input vector from joystick / keyboard / canvas
+  // Окно диалога всегда показывает актуальное состояние NPC (например, только что принятое задание).
+  const dialogNPC = dialogNpcId ? npcs.find(n => n.id === dialogNpcId) ?? null : null;
+
+  // Направление движения от джойстика, клавиш или пальца на экране (от −1 до 1 по каждой оси).
   const inputVectorRef = useRef({ x: 0, y: 0 });
   const isCanvasDraggingRef = useRef(false);
-  const missionStartTimeRef = useRef(Date.now());
-  const deliveredStationMissionIdsRef = useRef<Set<string>>(new Set());
+  const missionStartTimeRef = useRef(initial.missionStartTime);
+  // Заказы, для которых терминал станции уже открывался сам (чтобы не открывать повторно).
+  const deliveredStationMissionIdsRef = useRef<Set<string>>(
+    new Set(boot.kind === 'ok' ? boot.data.arrivedMissionIds : [])
+  );
 
-  // Check for nearby interactive NPC, Resource Node, or Station
-  const nearbyStation = stations.find(
-    s => Math.hypot(s.x - player.x, s.y - player.y) < 2.8
-  ) || null;
+  // Что рядом с курьером: станция, NPC, ресурс (для подсказок и кнопок взаимодействия).
+  const nearbyStation =
+    stations.find(s => Math.hypot(s.x - hudPlayer.x, s.y - hudPlayer.y) < STATION_INTERACT_RADIUS) || null;
+  const nearbyNPC = npcs.find(n => Math.hypot(n.x - hudPlayer.x, n.y - hudPlayer.y) < NPC_INTERACT_RADIUS) || null;
+  const nearbyResource =
+    resourceNodes.find(
+      r => !r.harvested && Math.hypot(r.x - hudPlayer.x, r.y - hudPlayer.y) < RESOURCE_INTERACT_RADIUS
+    ) || null;
 
-  const nearbyNPC = npcs.find(
-    n => Math.hypot(n.x - player.x, n.y - player.y) < 3.2
-  ) || null;
+  // Активное задание NPC и его цель — над ней рисуется голографический маяк.
+  const activeQuest = npcs.flatMap(n => n.quests).find(q => q.status === 'ACTIVE');
+  const activeQuestTarget = useMemo(
+    () =>
+      activeQuest?.targetCoordinates
+        ? {
+            x: activeQuest.targetCoordinates.x,
+            y: activeQuest.targetCoordinates.y,
+            title: activeQuest.targetName || activeQuest.title
+          }
+        : null,
+    [activeQuest]
+  );
 
-  const nearbyResource = resourceNodes.find(
-    r => !r.harvested && Math.hypot(r.x - player.x, r.y - player.y) < 2.5
-  ) || null;
+  const anyModalOpen = Boolean(
+    stationModalStation || pdaOpen || cargoModalOpen || craftingModalOpen || dialogNPC || deliveryReport || menuOpen
+  );
 
-  // Direct canvas touch/click-to-move handlers
+  // ----------------------------------------------------------------------
+  // «Последнее известное состояние» для игрового цикла и сохранений.
+  // Игровой цикл запускается один раз и живёт всю игру, поэтому свежие данные из React
+  // он берёт отсюда. Ящик обновляется после каждой перерисовки интерфейса.
+  // ----------------------------------------------------------------------
+  const latestRef = useRef({
+    cargo,
+    tools,
+    resources,
+    structures,
+    equippedGear,
+    npcs,
+    resourceNodes,
+    lostCaches,
+    stations,
+    missions,
+    activeMission,
+    activeQuest,
+    activeQuestTarget,
+    totalWeightKg,
+    anyModalOpen,
+    discoveredRegionIds,
+    npcRelations
+  });
+  useLayoutEffect(() => {
+    latestRef.current = {
+      cargo,
+      tools,
+      resources,
+      structures,
+      equippedGear,
+      npcs,
+      resourceNodes,
+      lostCaches,
+      stations,
+      missions,
+      activeMission,
+      activeQuest,
+      activeQuestTarget,
+      totalWeightKg,
+      anyModalOpen,
+      discoveredRegionIds,
+      npcRelations
+    };
+  });
+
+  // ======================================================================
+  // ПОДГРУЗКА РЕГИОНОВ
+  // ======================================================================
+  // Загрузить регионы, которых ещё нет в памяти, и добавить их контент в мир.
+  const ensureRegionsLoaded = useCallback((regionIds: string[]) => {
+    for (const regionId of regionIds) {
+      if (loadedRegionIdsRef.current.has(regionId)) continue;
+      loadedRegionIdsRef.current.add(regionId);
+
+      loadRegion(regionId)
+        .then(content => {
+          // Новые аномалии считаются «только что обновлёнными», им нечего догонять.
+          const now = gameTimeRef.current;
+          anomaliesRef.current = [
+            ...anomaliesRef.current,
+            ...content.anomalies.map(a => ({ ...a, lastSimulatedAt: now }))
+          ];
+          // Задания и собранные ресурсы — с учётом прогресса из сохранения.
+          setNpcs(prev => [...prev, ...applySavedQuests(content.npcs, savedQuestsRef.current)]);
+          setResourceNodes(prev => [
+            ...prev,
+            ...content.resourceNodes.map(n => (harvestedIdsRef.current.has(n.id) ? { ...n, harvested: true } : n))
+          ]);
+          setLostCaches(prev => [...prev, ...content.lostCaches]);
+          setJournalEntries(prev =>
+            [...prev, ...content.journal].sort((a, b) => regionOrder(a.regionId) - regionOrder(b.regionId))
+          );
+        })
+        .catch(() => {
+          // Не удалось скачать (например, пропал интернет) — попробуем при следующей проверке.
+          loadedRegionIdsRef.current.delete(regionId);
+        });
+    }
+  }, []);
+
+  // При запуске: регион, где стоит курьер, плюс все открытые ранее (их записи нужны дневнику).
+  useEffect(() => {
+    const p = playerRef.current;
+    ensureRegionsLoaded([getRegionAt(p.x, p.y).id, ...initial.discoveredRegionIds]);
+  }, [ensureRegionsLoaded, initial]);
+
+  // Курьер сдвинулся на новую клетку: подгрузить соседние регионы и проверить, не вошёл ли
+  // он в неоткрытый регион (тогда открываются записи дневника и показывается уведомление).
+  const playerTileX = Math.round(hudPlayer.x);
+  const playerTileY = Math.round(hudPlayer.y);
+  useEffect(() => {
+    ensureRegionsLoaded(regionsNearPoint(playerTileX, playerTileY));
+
+    const currentRegion = getRegionAt(playerTileX, playerTileY);
+    if (discoveredRegionIds.includes(currentRegion.id)) return;
+
+    setDiscoveredRegionIds(prev => (prev.includes(currentRegion.id) ? prev : [...prev, currentRegion.id]));
+    sound.playDiscoveryChime();
+    loadRegion(currentRegion.id)
+      .then(content => setRegionDiscoveryAlert({ region: currentRegion, unlockedCount: content.journal.length }))
+      .catch(() => setRegionDiscoveryAlert({ region: currentRegion, unlockedCount: 0 }));
+  }, [playerTileX, playerTileY, discoveredRegionIds, ensureRegionsLoaded]);
+
+  // Уведомление об открытии региона само исчезает через 7 секунд.
+  useEffect(() => {
+    if (regionDiscoveryAlert) {
+      const timer = setTimeout(() => setRegionDiscoveryAlert(null), 7000);
+      return () => clearTimeout(timer);
+    }
+  }, [regionDiscoveryAlert]);
+
+  // ======================================================================
+  // СОХРАНЕНИЯ
+  // ======================================================================
+  const persistGame = useCallback((): boolean => {
+    if (savingDisabledRef.current) return false;
+    const s = latestRef.current;
+    const ok = saveGame({
+      player: playerRef.current,
+      cargo: s.cargo,
+      tools: s.tools,
+      resources: s.resources,
+      equippedGear: s.equippedGear,
+      structures: s.structures,
+      missionStatuses: Object.fromEntries(s.missions.map(m => [m.id, m.status])),
+      activeMissionId: s.activeMission?.id ?? null,
+      missionElapsedSec: (Date.now() - missionStartTimeRef.current) / 1000,
+      arrivedMissionIds: [...deliveredStationMissionIdsRef.current],
+      connectedStationIds: s.stations.filter(st => st.connected).map(st => st.id),
+      discoveredRegionIds: s.discoveredRegionIds,
+      // Прогресс незагруженных регионов берём из старого сохранения, загруженных — из игры.
+      quests: { ...savedQuestsRef.current, ...collectQuestStates(s.npcs) },
+      harvestedResourceNodeIds: [...harvestedIdsRef.current],
+      npcRelations: s.npcRelations
+    });
+    if (ok) {
+      setLastSavedAt(new Date());
+    } else {
+      setSaveNotice('Не удалось сохранить игру: браузер не даёт записать данные (возможно, закончилось место или включён приватный режим).');
+    }
+    return ok;
+  }, []);
+
+  // Автосохранение каждые 30 секунд, а также когда игрок сворачивает или закрывает вкладку.
+  useEffect(() => {
+    const interval = setInterval(persistGame, AUTOSAVE_INTERVAL_MS);
+    const handleVisibility = () => {
+      if (document.visibilityState === 'hidden') persistGame();
+    };
+    const handleExit = () => {
+      persistGame();
+    };
+    document.addEventListener('visibilitychange', handleVisibility);
+    window.addEventListener('pagehide', handleExit);
+    window.addEventListener('beforeunload', handleExit);
+    return () => {
+      clearInterval(interval);
+      document.removeEventListener('visibilitychange', handleVisibility);
+      window.removeEventListener('pagehide', handleExit);
+      window.removeEventListener('beforeunload', handleExit);
+    };
+  }, [persistGame]);
+
+  // «Начать заново» (уже подтверждено игроком в меню): стираем сохранение и перезапускаем страницу.
+  const handleRestartGame = () => {
+    // Запрещаем сохранение, иначе сохранение при закрытии страницы записало бы прогресс обратно.
+    savingDisabledRef.current = true;
+    deleteSave();
+    window.location.reload();
+  };
+
+  // ======================================================================
+  // УПРАВЛЕНИЕ ПАЛЬЦЕМ/МЫШЬЮ ПО ХОЛСТУ
+  // Курьер идёт в сторону точки касания относительно центра экрана. В круге радиусом
+  // 25 пикселей вокруг центра он стоит; на 140 пикселях и дальше идёт в полную силу.
+  // ======================================================================
   const updateCanvasInput = useCallback((clientX: number, clientY: number) => {
-    const centerX = window.innerWidth / 2;
-    const centerY = window.innerHeight / 2;
-    const dx = clientX - centerX;
-    const dy = clientY - centerY;
+    const dx = clientX - window.innerWidth / 2;
+    const dy = clientY - window.innerHeight / 2;
     const dist = Math.hypot(dx, dy);
     if (dist > 25) {
-      const maxMag = Math.min(1, dist / 140);
-      inputVectorRef.current = {
-        x: (dx / dist) * maxMag,
-        y: (dy / dist) * maxMag
-      };
+      const strength = Math.min(1, dist / 140);
+      inputVectorRef.current = { x: (dx / dist) * strength, y: (dy / dist) * strength };
     } else {
       inputVectorRef.current = { x: 0, y: 0 };
     }
@@ -198,28 +531,20 @@ export default function App() {
       try {
         (e.currentTarget as HTMLElement).releasePointerCapture?.(e.pointerId);
       } catch {
-        // safe
+        // палец уже отпущен — ничего страшного
       }
       inputVectorRef.current = { x: 0, y: 0 };
     }
   };
 
-  // Find active quest target for holographic renderer column
-  const activeQuest = npcs.flatMap(n => n.quests).find(q => q.status === 'ACTIVE');
-  const activeQuestTarget = activeQuest?.targetCoordinates
-    ? {
-        x: activeQuest.targetCoordinates.x,
-        y: activeQuest.targetCoordinates.y,
-        title: activeQuest.targetName || activeQuest.title
-      }
-    : null;
-
-  // Initialize Canvas & Renderer
+  // ======================================================================
+  // ПОДГОТОВКА ХОЛСТА: размер под окно, снежинки, колёсико мыши для масштаба
+  // ======================================================================
   useEffect(() => {
     if (!canvasRef.current) return;
     rendererRef.current = new TaigaRenderer(canvasRef.current);
 
-    // Populate initial snow particles
+    // 90 снежинок: скорость падения 1.5–4 пикселя за кадр, каждая пятая — крупная (2 пикселя).
     const particles = [];
     for (let i = 0; i < 90; i++) {
       particles.push({
@@ -240,602 +565,191 @@ export default function App() {
     handleResize();
     window.addEventListener('resize', handleResize);
 
-    // Mouse wheel zoom support with progressive LOD trigger
+    // Колёсико мыши: шаг масштаба 0.1. Над окнами и полями ввода колёсико их прокручивает.
     const canvas = canvasRef.current;
     const handleWheel = (e: WheelEvent) => {
-      // Ignore if hovering over modal or input
       if (e.target instanceof HTMLElement && e.target.closest('.modal-content, [role="dialog"], input, textarea')) {
         return;
       }
       e.preventDefault();
       const delta = e.deltaY < 0 ? 0.1 : -0.1;
-      const nextZoom = Math.max(0.65, Math.min(2.5, Math.round((zoomRef.current + delta) * 100) / 100));
+      const nextZoom = clampZoom(zoomRef.current + delta);
       setZoom(nextZoom);
       zoomRef.current = nextZoom;
     };
-
-    if (canvas) {
-      canvas.addEventListener('wheel', handleWheel, { passive: false });
-    }
+    canvas.addEventListener('wheel', handleWheel, { passive: false });
 
     return () => {
       window.removeEventListener('resize', handleResize);
-      if (canvas) {
-        canvas.removeEventListener('wheel', handleWheel);
-      }
+      canvas.removeEventListener('wheel', handleWheel);
     };
   }, []);
 
-  // Exploration & Lore snippet unlocks
-  useEffect(() => {
-    const currentRegion = getRegionAt(player.x, player.y);
-    setDiscoveredRegionIds(prev => {
-      if (!prev.includes(currentRegion.id)) {
-        sound.playDiscoveryChime();
-        const entries = getEntriesForRegion(currentRegion.id);
-        setRegionDiscoveryAlert({
-          region: currentRegion,
-          unlockedCount: entries.length
-        });
-        return [...prev, currentRegion.id];
-      }
-      return prev;
-    });
-  }, [Math.round(player.x), Math.round(player.y)]);
-
-  // Auto-dismiss discovery notification banner
-  useEffect(() => {
-    if (regionDiscoveryAlert) {
-      const timer = setTimeout(() => {
-        setRegionDiscoveryAlert(null);
-      }, 7000);
-      return () => clearTimeout(timer);
-    }
-  }, [regionDiscoveryAlert]);
-
-  // Dynamic background wind sound crossfade with weather changes
+  // Звук ветра меняется вместе с погодой.
   useEffect(() => {
     sound.updateWeatherWind(weather.type, weather.windSpeed);
   }, [weather.type, weather.windSpeed]);
 
-  // Unlock Web Audio context and start ambient wind on first user interaction
+  // Браузеры разрешают звук только после первого нажатия игрока — тогда и включаем ветер.
   useEffect(() => {
     const handleFirstInteraction = () => {
       sound.init();
-      sound.updateWeatherWind(weather.type, weather.windSpeed);
+      sound.updateWeatherWind(weatherRef.current.type, weatherRef.current.windSpeed);
     };
-
     window.addEventListener('pointerdown', handleFirstInteraction, { once: true });
     window.addEventListener('keydown', handleFirstInteraction, { once: true });
-
     return () => {
       window.removeEventListener('pointerdown', handleFirstInteraction);
       window.removeEventListener('keydown', handleFirstInteraction);
     };
-  }, [weather.type, weather.windSpeed]);
+  }, []);
 
-  // Main 60FPS Game Loop
+  // ======================================================================
+  // ИГРОВОЙ ЦИКЛ — 60 раз в секунду
+  // Запускается один раз. Ничего из того, что здесь меняется каждый кадр, не трогает React:
+  // интерфейс обновляется только по событиям (упал, сменилась погода) и раз в 0.1 секунды.
+  // ======================================================================
   useEffect(() => {
     let animId: number;
     let lastTime = performance.now();
-    let stepCycle = 0;
-    let heartbeatTimer = 0;
+    const timers: PlayerStepTimers = { stepCycle: 0, heartbeatTimer: 0 };
+    let hudTimer = 0;
 
     const loop = (currentTime: number) => {
+      // Сколько секунд прошло с прошлого кадра. Не больше 0.1 с: если вкладка «подвисла»
+      // или была свёрнута, курьер не должен телепортироваться на огромный шаг.
       const dt = Math.min((currentTime - lastTime) / 1000, 0.1);
       lastTime = currentTime;
+      gameTimeRef.current += dt;
+      const gameTime = gameTimeRef.current;
+      const s = latestRef.current;
 
-      // ----------------------------------------------------
-      // Dynamic Weather System Transition & Physical Impact
-      // ----------------------------------------------------
-      setWeather(prev => {
-        if (prev.timeToChange <= dt) {
-          const weatherCycle: WeatherState['type'][] = [
-            'CLEAR_FROST',
-            'LIGHT_SNOW',
-            'BLIZZARD',
-            'EXTREME_COLD',
-            'HEAVY_SNOWFALL',
-            'ANOMALOUS_AURORA',
-            'MAGNETIC_STORM'
-          ];
-          const nextType = weatherCycle[Math.floor(Math.random() * weatherCycle.length)];
-          const config: Record<WeatherState['type'], {
-            nameRu: string;
-            temp: number;
-            windSpeed: number;
-            windX: number;
-            windY: number;
-            visibility: number;
-            anomIntensity: number;
-            dangerLevel: WeatherState['dangerLevel'];
-            description: string;
-          }> = {
-            CLEAR_FROST: {
-              nameRu: 'Ясный мороз',
-              temp: -22,
-              windSpeed: 2.5,
-              windX: 0.8,
-              windY: 0.4,
-              visibility: 0.95,
-              anomIntensity: 0.15,
-              dangerLevel: 'LOW',
-              description: 'Чистое небо и морозный воздух. Стабильное сцепление.'
-            },
-            LIGHT_SNOW: {
-              nameRu: 'Тихий снегопад',
-              temp: -18,
-              windSpeed: 3.0,
-              windX: 0.5,
-              windY: 1.0,
-              visibility: 0.85,
-              anomIntensity: 0.2,
-              dangerLevel: 'LOW',
-              description: 'Слабый снег, безопасные условия перемещения.'
-            },
-            BLIZZARD: {
-              nameRu: 'Свирепый буран',
-              temp: -34,
-              windSpeed: 9.5,
-              windX: 2.2,
-              windY: 1.4,
-              visibility: 0.35,
-              anomIntensity: 0.45,
-              dangerLevel: 'EXTREME',
-              description: 'Шквальный ветер и нулевая видимость! Риск потери груза и замерзания.'
-            },
-            EXTREME_COLD: {
-              nameRu: 'Аномальный мороз (-42°C)',
-              temp: -42,
-              windSpeed: 4.0,
-              windX: 0.6,
-              windY: 0.3,
-              visibility: 0.8,
-              anomIntensity: 0.6,
-              dangerLevel: 'HIGH',
-              description: 'Критическое падение температуры до -42°C. Ускоренная гипотермия.'
-            },
-            HEAVY_SNOWFALL: {
-              nameRu: 'Глубокий снегопад',
-              temp: -16,
-              windSpeed: 2.0,
-              windX: 0.3,
-              windY: 1.8,
-              visibility: 0.55,
-              anomIntensity: 0.25,
-              dangerLevel: 'MEDIUM',
-              description: 'Сугробы по колено. Высокий износ обуви и расход выносливости.'
-            },
-            ANOMALOUS_AURORA: {
-              nameRu: 'Полярное сияние (Аномалия)',
-              temp: -24,
-              windSpeed: 1.8,
-              windX: 0.5,
-              windY: 0.2,
-              visibility: 0.9,
-              anomIntensity: 0.85,
-              dangerLevel: 'MEDIUM',
-              description: 'Ионизация атмосферы. Радар Эхо-4 усиливается, аномалии возбуждены.'
-            },
-            MAGNETIC_STORM: {
-              nameRu: 'Геомагнитная буря',
-              temp: -20,
-              windSpeed: 6.5,
-              windX: -1.5,
-              windY: 1.0,
-              visibility: 0.65,
-              anomIntensity: 0.95,
-              dangerLevel: 'HIGH',
-              description: 'Геомагнитные помехи. Сенсоры дают сбои, фантомы агрессивны.'
-            }
-          };
+      // --- 1. Погода ---
+      const weatherTick = tickWeather(weatherRef.current, dt);
+      weatherRef.current = weatherTick.weather;
+      const currentWeather = weatherTick.weather;
+      if (weatherTick.changed) {
+        sound.updateWeatherWind(currentWeather.type, currentWeather.windSpeed);
+        setWeather(currentWeather);
+      }
 
-          const c = config[nextType];
-          sound.updateWeatherWind(nextType, c.windSpeed);
+      // --- 2. Курьер: движение, баланс, выживание ---
+      const step = stepPlayer(
+        playerRef.current,
+        {
+          input: inputVectorRef.current,
+          dt,
+          tiles: world.tiles,
+          structures: s.structures,
+          weather: currentWeather,
+          gear: s.equippedGear,
+          totalWeightKg: s.totalWeightKg
+        },
+        timers
+      );
+      const player = step.player;
+      playerRef.current = player;
 
-          return {
-            ...prev,
-            type: nextType,
-            nameRu: c.nameRu,
-            tempCelsius: c.temp,
-            windSpeed: c.windSpeed,
-            windX: c.windX,
-            windY: c.windY,
-            visibility: c.visibility,
-            anomalyIntensity: c.anomIntensity,
-            dangerLevel: c.dangerLevel,
-            description: c.description,
-            timeToChange: 45 + Math.random() * 40
-          };
-        }
-        return { ...prev, timeToChange: prev.timeToChange - dt };
-      });
-
-      // ----------------------------------------------------
-      // Update Player Physics & Weather Physical Consequences
-      // ----------------------------------------------------
-      setPlayer(prev => {
-        if (isGameOver) return prev;
-
-        const input = inputVectorRef.current;
-        const isMoving = Math.abs(input.x) > 0.05 || Math.abs(input.y) > 0.05;
-
-        // Current tile properties
-        const curCol = Math.max(0, Math.min(MAP_COLS - 1, Math.floor(prev.x)));
-        const curRow = Math.max(0, Math.min(MAP_ROWS - 1, Math.floor(prev.y)));
-        const curTile = worldRef.current.tiles[curRow][curCol];
-
-        // Has ladder structure on current tile?
-        const hasLadder = structures.some(
-          s => s.type === 'LADDER' && Math.hypot(s.x - prev.x, s.y - prev.y) < 1.4
-        );
-
-        // Terrain movement factors
-        let speedMultiplier = 1.0;
-        let isDeepSnow = false;
-
-        if (curTile.type === 'SNOW_DEEP') {
-          // Snowshoes crafted gear negates snow penalty!
-          speedMultiplier = equippedGear.snowshoes ? 0.88 : 0.55;
-          isDeepSnow = true;
-        } else if (curTile.type === 'OLD_ROAD' || curTile.type === 'STATION_PLATFORM') {
-          speedMultiplier = 1.25;
-        } else if (curTile.type === 'ICE_RIVER') {
-          speedMultiplier = 1.1; // slippery
-        } else if (curTile.type === 'ROCKS' || curTile.type === 'CLIFF') {
-          if (!hasLadder) {
-            speedMultiplier = 0.35; // very rough without ladder
-          }
-        }
-
-        // Weather conditions movement impact
-        if (weather.type === 'BLIZZARD') {
-          speedMultiplier *= 0.6; // Heavy wind resistance
-        } else if (weather.type === 'HEAVY_SNOWFALL') {
-          speedMultiplier *= 0.75; // Thick powdery snow slowing footsteps
-        }
-
-        // Sprint boost or Sneak slowdown
-        if (prev.isSprinting && prev.stamina > 5) {
-          speedMultiplier *= 1.5;
-        } else if (prev.isHoldingBreath) {
-          speedMultiplier *= 0.65;
-        }
-
-        // Weight carry burden
-        const totalCargoWeight = cargo.reduce((acc, c) => acc + c.weightKg, 0);
-        const totalToolWeight = tools.reduce((acc, t) => acc + t.weightKg * t.count, 0);
-        const totalResourceWeight = resources.reduce((acc, r) => acc + r.weightKg * r.count, 0);
-        const totalWeightKg = totalCargoWeight + totalToolWeight + totalResourceWeight;
-        const weightFactor = Math.max(0.6, 1 - (totalWeightKg / 55) * 0.4);
-        speedMultiplier *= weightFactor;
-
-        // Velocity & Position
-        const targetVx = input.x * 2.8 * speedMultiplier;
-        const targetVy = input.y * 2.8 * speedMultiplier;
-        const friction = curTile.type === 'ICE_RIVER' ? 0.08 : 0.28;
-        const newVx = prev.vx + (targetVx - prev.vx) * friction;
-        const newVy = prev.vy + (targetVy - prev.vy) * friction;
-
-        let nextX = prev.x + newVx * dt;
-        let nextY = prev.y + newVy * dt;
-
-        // Map boundaries clamp
-        nextX = Math.max(2, Math.min(MAP_COLS - 3, nextX));
-        nextY = Math.max(2, Math.min(MAP_ROWS - 3, nextY));
-
-        // Facing Angle
-        const facingAngle = isMoving ? Math.atan2(newVy, newVx) : prev.facingAngle;
-
-        // Footsteps in snow
-        if (isMoving) {
-          stepCycle += dt * 5 * speedMultiplier;
-          if (stepCycle > 1) {
-            stepCycle = 0;
-            sound.playFootstep(isDeepSnow);
-            footstepsRef.current.push({
-              x: nextX,
-              y: nextY,
-              angle: facingAngle,
-              isLeft: footstepsRef.current.length % 2 === 0,
-              depth: isDeepSnow ? 2 : 1,
-              alpha: 1.0
-            });
-            if (footstepsRef.current.length > 120) {
-              footstepsRef.current.shift();
-            }
-          }
-        }
-
-        // ----------------------------------------------------
-        // Signature Death Stranding Cargo Balance Physics
-        // ----------------------------------------------------
-        let newBalance = prev.balance;
-        let stumbleAlert: PlayerStats['stumbleAlert'] = 'NONE';
-        let isStumbling = prev.isStumbling;
-        let stumbleTimer = prev.stumbleTimer;
-
-        if (isMoving && !isStumbling) {
-          // Uneven terrain or wind gust shifts center of gravity
-          let windPush = weather.windX * (weather.windSpeed / 10) * 0.4;
-          if (equippedGear.mask) windPush *= 0.65; // Storm mask lowers wind sway
-          const randomTilt = (Math.random() - 0.5) * (isDeepSnow ? 3.5 : 1.8);
-          newBalance += (randomTilt + windPush) * (totalWeightKg / 20);
-
-          // Counter-balancing by gripping backpack straps [L] and [R]
-          if (prev.isBracingLeft) {
-            newBalance -= 38 * dt;
-          }
-          if (prev.isBracingRight) {
-            newBalance += 38 * dt;
-          }
-
-          // Natural center-seeking inertia if not overloaded
-          if (!prev.isBracingLeft && !prev.isBracingRight) {
-            newBalance *= 0.985;
-          }
-        }
-
-        // Clamp balance
-        newBalance = Math.max(-100, Math.min(100, newBalance));
-
-        // Stumble Thresholds
-        if (newBalance < -50) {
-          stumbleAlert = 'LEFT';
-        } else if (newBalance > 50) {
-          stumbleAlert = 'RIGHT';
-        }
-
-        if (Math.abs(newBalance) > 70 && !isStumbling) {
-          stumbleAlert = 'CRITICAL';
-          stumbleTimer += dt;
-          sound.playStumbleWarning();
-
-          // If unbraced for more than 1.1s: FALL & DAMAGE CARGO!
-          if (stumbleTimer > 1.1) {
-            isStumbling = true;
-            stumbleTimer = 0;
-            sound.playCargoImpact();
-            // Damage carried cargo containers
-            setCargo(prevCargo =>
-              prevCargo.map(c => ({
-                ...c,
-                currentIntegrity: Math.max(10, c.currentIntegrity - (15 + Math.random() * 15))
-              }))
-            );
-          }
-        } else {
-          stumbleTimer = Math.max(0, stumbleTimer - dt * 2);
-        }
-
-        // Recover from stumble
-        if (isStumbling) {
-          stumbleTimer += dt;
-          if (stumbleTimer > 1.8) {
-            isStumbling = false;
-            stumbleTimer = 0;
-            newBalance = 0;
-          }
-        }
-
-        // ----------------------------------------------------
-        // Survival Meters: Warmth, Stamina, Breath, Battery
-        // ----------------------------------------------------
-        let newStamina = prev.stamina;
-        let newWarmth = prev.warmth;
-        let newBattery = prev.battery;
-        let newBoots = prev.bootsIntegrity;
-        let newBreath = prev.breathAir;
-
-        // Shelter / Campfire warmth radius check
-        const nearShelter = structures.some(
-          s => s.type === 'SHELTER' && Math.hypot(s.x - nextX, s.y - nextY) < 3.5
-        );
-        const nearCampfire = structures.some(
-          s => s.type === 'CAMPFIRE' && Math.hypot(s.x - nextX, s.y - nextY) < 2.5
-        );
-
-        if (nearShelter) {
-          // Portable shelter full protection
-          newWarmth = Math.min(100, newWarmth + 24 * dt);
-          newStamina = Math.min(prev.maxStamina, newStamina + 18 * dt);
-        } else if (nearCampfire) {
-          newWarmth = Math.min(100, newWarmth + 16 * dt);
-          newStamina = Math.min(prev.maxStamina, newStamina + 10 * dt);
-        } else {
-          // Cold exposure calculation based on weather & clothing
-          let frostDrain = 0.35;
-          if (weather.type === 'BLIZZARD') frostDrain = 1.7;
-          else if (weather.type === 'EXTREME_COLD') frostDrain = 2.4;
-          else if (weather.type === 'HEAVY_SNOWFALL') frostDrain = 0.65;
-
-          // Gear insulation bonus (e.g. Parka)
-          if (equippedGear.coat) {
-            frostDrain *= (1 - equippedGear.coat.coldResist);
-          }
-
-          newWarmth = Math.max(0, newWarmth - frostDrain * dt);
-
-          // Hypothermia chills stamina
-          if (newWarmth < 25) {
-            newStamina = Math.max(0, newStamina - 2.5 * dt);
-          }
-        }
-
-        // Stamina drain from movement / deep snow / sprinting
-        if (isMoving) {
-          const staminaCost = (prev.isSprinting ? 12 : 3) * (isDeepSnow ? 1.8 : 1.0);
-          newStamina = Math.max(0, newStamina - staminaCost * dt);
-
-          let bootWear = curTile.type === 'ROCKS' ? 0.5 : 0.08;
-          if (weather.type === 'HEAVY_SNOWFALL') bootWear *= 1.5;
-          if (equippedGear.reinforcedBoots) bootWear *= (1 - equippedGear.reinforcedBoots.durabilityBonus);
-          newBoots = Math.max(0, newBoots - bootWear * dt);
-        } else {
-          newStamina = Math.min(prev.maxStamina, newStamina + 12 * dt);
-        }
-
-        // Holding breath in stealth near phantoms
-        if (prev.isHoldingBreath) {
-          newBreath = Math.max(0, newBreath - 18 * dt);
-          heartbeatTimer += dt;
-          if (heartbeatTimer > 0.8) {
-            heartbeatTimer = 0;
-            sound.playHeartbeat();
-          }
-        } else {
-          newBreath = Math.min(100, newBreath + 30 * dt);
-        }
-
-        // Battery drain or Anomalous Aurora recharge!
-        if (weather.type === 'ANOMALOUS_AURORA') {
-          newBattery = Math.min(100, newBattery + 2.5 * dt); // Chiral energy trickle
-        } else {
-          newBattery = Math.max(0, newBattery - 0.08 * dt);
-        }
-
-        // Scanner wave expansion
-        let scannerProgress = prev.scannerPulseProgress;
-        let scannerActive = prev.scannerActive;
-        let scannerCooldown = Math.max(0, prev.scannerCooldown - dt * 1000);
-
-        if (scannerActive) {
-          scannerProgress += dt * 1.5;
-          if (scannerProgress >= 1.0) {
-            scannerActive = false;
-          }
-        }
-
-        return {
-          ...prev,
-          x: nextX,
-          y: nextY,
-          vx: newVx,
-          vy: newVy,
-          facingAngle,
-          balance: newBalance,
-          stumbleAlert,
-          stumbleTimer,
-          isStumbling,
-          stamina: newStamina,
-          warmth: newWarmth,
-          battery: newBattery,
-          bootsIntegrity: newBoots,
-          breathAir: newBreath,
-          scannerCooldown,
-          scannerPulseProgress: scannerProgress,
-          scannerActive
-        };
-      });
-
-      // ----------------------------------------------------
-      // Update Anomalies AI & Flare Repulsion
-      // ----------------------------------------------------
-      setAnomalies(prevAnoms => {
-        return prevAnoms.map(anom => {
-          if (anom.type === 'FROST_PHANTOM') {
-            const dist = Math.hypot(anom.x - player.x, anom.y - player.y);
-
-            // Audio click when scanner detects phantom
-            if (dist < 6.0 && Math.random() < 0.15) {
-              sound.playAnomalyTick(Math.min(1, (7 - dist) / 4));
-            }
-
-            // Repelled by nearby magnesium flare
-            const nearFlare = structures.some(
-              s => s.type === 'FLARE' && Math.hypot(s.x - anom.x, s.y - anom.y) < 5.5
-            );
-
-            let suspicion = anom.suspicion;
-            if (nearFlare) {
-              suspicion = 0;
-            } else if (dist < 5.0) {
-              if (player.isHoldingBreath) {
-                suspicion = Math.max(0, suspicion - dt * 10);
-              } else if (player.isSprinting) {
-                suspicion = Math.min(100, suspicion + dt * 45);
-              } else if (Math.hypot(player.vx, player.vy) > 0.1) {
-                suspicion = Math.min(100, suspicion + dt * 20);
-              }
-            } else {
-              suspicion = Math.max(0, suspicion - dt * 15);
-            }
-
-            // Patrol drift
-            const newDriftAngle = anom.driftAngle + (Math.random() - 0.5) * 0.1;
-            const driftSpeed = nearFlare ? 1.4 : suspicion > 50 ? 0.8 : 0.25;
-            const newX = anom.x + Math.cos(newDriftAngle) * driftSpeed * dt;
-            const newY = anom.y + Math.sin(newDriftAngle) * driftSpeed * dt;
-
-            return {
-              ...anom,
-              x: newX,
-              y: newY,
-              driftAngle: newDriftAngle,
-              suspicion,
-              state: nearFlare ? 'PATROLLING' : suspicion > 70 ? 'HUNTING' : suspicion > 25 ? 'ALERT' : 'PATROLLING',
-              pulseTimer: anom.pulseTimer + 1
-            };
-          }
-          return anom;
+      if (step.events.footstep) {
+        sound.playFootstep(step.events.footstep.deepSnow);
+        footstepsRef.current.push({
+          x: player.x,
+          y: player.y,
+          angle: player.facingAngle,
+          isLeft: footstepsRef.current.length % 2 === 0,
+          depth: step.events.footstep.deepSnow ? 2 : 1,
+          alpha: 1.0
         });
+        // Храним последние 120 следов, самые старые исчезают.
+        if (footstepsRef.current.length > 120) {
+          footstepsRef.current.shift();
+        }
+      }
+      if (step.events.stumbleWarning) sound.playStumbleWarning();
+      if (step.events.fell) {
+        sound.playCargoImpact();
+        // Падение бьёт каждый контейнер на 15–30% целостности, но не ниже 10%.
+        setCargo(prevCargo =>
+          prevCargo.map(c => ({
+            ...c,
+            currentIntegrity: Math.max(10, c.currentIntegrity - (15 + Math.random() * 15))
+          }))
+        );
+      }
+      if (step.events.heartbeat) sound.playHeartbeat();
+
+      // --- 3. Аномалии: полный расчёт только в зоне активности вокруг курьера ---
+      const canvas = canvasRef.current;
+      const activityRadius = getActivityRadius(
+        canvas?.width ?? window.innerWidth,
+        canvas?.height ?? window.innerHeight,
+        zoomRef.current
+      );
+      anomaliesRef.current = anomaliesRef.current.map(anom => {
+        // Далеко от курьера и не нужна для задания — «спит», не тратим на неё время.
+        if (!shouldSimulate(anom, player, activityRadius, s.activeQuestTarget)) return anom;
+        // Только что проснулась — сначала догоняем пропущенное время, потом обычный кадр.
+        const result = updateAnomaly(wakeUpIfDormant(anom, gameTime), player, s.structures, dt, gameTime);
+        if (result.tickVolume !== null) sound.playAnomalyTick(result.tickVolume);
+        return result.anomaly;
       });
 
-      // Fade footstep alpha
-      footstepsRef.current.forEach(step => {
-        step.alpha = Math.max(0, step.alpha - dt * 0.02);
+      // --- 4. Следы тают: полностью исчезают примерно за 50 секунд ---
+      footstepsRef.current.forEach(footstep => {
+        footstep.alpha = Math.max(0, footstep.alpha - dt * 0.02);
       });
 
-      // Update Snow Particles
-      if (canvasRef.current) {
-        const w = canvasRef.current.width;
-        const h = canvasRef.current.height;
+      // --- 5. Снежинки падают (в буран втрое быстрее) и сносятся ветром ---
+      if (canvas) {
+        const w = canvas.width;
+        const h = canvas.height;
+        const fallSpeed =
+          currentWeather.type === 'BLIZZARD' ? 3.2 : currentWeather.type === 'HEAVY_SNOWFALL' ? 2.0 : 1.0;
         snowParticlesRef.current.forEach(p => {
-          const speedMod = weather.type === 'BLIZZARD' ? 3.2 : weather.type === 'HEAVY_SNOWFALL' ? 2.0 : 1.0;
-          p.y += p.speed * speedMod;
-          p.x += weather.windX * weather.windSpeed * 0.8;
+          p.y += p.speed * fallSpeed;
+          p.x += currentWeather.windX * currentWeather.windSpeed * 0.8;
+          // Вылетевшая за край снежинка возвращается с другой стороны экрана.
           if (p.y > h) p.y = -5;
           if (p.x > w) p.x = 0;
           if (p.x < 0) p.x = w;
         });
       }
 
-      // Check arrival at active mission target station (auto-open only once upon reaching delivery destination)
-      if (
-        activeMission &&
-        !deliveredStationMissionIdsRef.current.has(activeMission.id) &&
-        !stationModalStation &&
-        !pdaOpen &&
-        !cargoModalOpen &&
-        !craftingModalOpen &&
-        !dialogNPC &&
-        !deliveryReport
-      ) {
-        const targetStation = stations.find(s => s.id === activeMission.targetStationId);
-        if (targetStation && Math.hypot(targetStation.x - player.x, targetStation.y - player.y) < 2.5) {
-          deliveredStationMissionIdsRef.current.add(activeMission.id);
+      // --- 6. Курьер дошёл до станции назначения — терминал открывается сам (один раз) ---
+      if (s.activeMission && !deliveredStationMissionIdsRef.current.has(s.activeMission.id) && !s.anyModalOpen) {
+        const targetStation = s.stations.find(st => st.id === s.activeMission!.targetStationId);
+        if (
+          targetStation &&
+          Math.hypot(targetStation.x - player.x, targetStation.y - player.y) < STATION_ARRIVAL_RADIUS
+        ) {
+          deliveredStationMissionIdsRef.current.add(s.activeMission.id);
           setStationModalStation(targetStation);
         }
       }
 
-      // Render Frame with Resource Nodes, NPCs, and Quest Target Beacon with progressive LOD
-      if (rendererRef.current) {
-        rendererRef.current.render(
-          worldRef.current.tiles,
-          player,
-          cargo,
-          structures,
-          anomalies,
-          weather,
-          footstepsRef.current,
-          lostCaches,
-          snowParticlesRef.current,
-          currentTime,
-          resourceNodes,
-          npcs,
-          activeQuestTarget,
-          zoomRef.current
-        );
+      // --- 7. Нарисовать кадр ---
+      rendererRef.current?.render(
+        world.tiles,
+        player,
+        s.cargo,
+        s.structures,
+        anomaliesRef.current,
+        currentWeather,
+        footstepsRef.current,
+        s.lostCaches,
+        snowParticlesRef.current,
+        currentTime,
+        s.resourceNodes,
+        s.npcs,
+        s.activeQuestTarget,
+        zoomRef.current
+      );
+
+      // --- 8. Обновить интерфейс, но не чаще 10 раз в секунду и только если есть что показать ---
+      hudTimer += dt;
+      if (hudTimer >= HUD_REFRESH_INTERVAL_SEC) {
+        hudTimer = 0;
+        if (playerHudKey(player) !== hudKeyRef.current) syncHud();
       }
 
       animId = requestAnimationFrame(loop);
@@ -843,127 +757,108 @@ export default function App() {
 
     animId = requestAnimationFrame(loop);
     return () => cancelAnimationFrame(animId);
-  }, [
-    player,
-    weather,
-    cargo,
-    structures,
-    anomalies,
-    lostCaches,
-    resourceNodes,
-    npcs,
-    equippedGear,
-    isGameOver,
-    isMuted,
-    pdaOpen,
-    cargoModalOpen,
-    craftingModalOpen,
-    dialogNPC,
-    stationModalStation,
-    deliveryReport,
-    stations,
-    activeQuestTarget,
-    tools,
-    resources
-  ]);
+  }, [world, syncHud]);
 
-  // Handle Odradek Scanner Pulse Action
+  // ======================================================================
+  // ДЕЙСТВИЯ ИГРОКА
+  // ======================================================================
+
+  // Отметить в отношениях с NPC: познакомились, выполнили задание, поторговали.
+  const updateRelation = (npcId: string, change: (r: NPCRelation) => NPCRelation) => {
+    setNpcRelations(prev => ({
+      ...prev,
+      [npcId]: change(prev[npcId] ?? { met: false, questsCompleted: 0, trades: 0 })
+    }));
+  };
+
+  const openDialog = (npc: WorldNPC) => {
+    setDialogNpcId(npc.id);
+    updateRelation(npc.id, r => ({ ...r, met: true }));
+  };
+
+  // Импульс сканера «Эхо-4»: подсвечивает клетки вокруг и засчитывает исследовательские задания.
   const handleScanPulse = useCallback(() => {
+    const player = playerRef.current;
     if (player.scannerCooldown > 0) return;
 
     sound.playScannerPing();
 
+    // Во время полярного сияния сканер бьёт дальше (12 клеток вместо 9)
+    // и перезаряжается быстрее (2 секунды вместо 3.5).
+    const isAurora = weatherRef.current.type === 'ANOMALOUS_AURORA';
+    const scanRadius = isAurora ? 12 : 9;
+
+    // Подсветка клеток держится 4 секунды (последние 2 — плавно гаснет, см. TaigaRenderer).
     const now = performance.now();
     const pCol = Math.floor(player.x);
     const pRow = Math.floor(player.y);
-    const scanRadius = weather.type === 'ANOMALOUS_AURORA' ? 12 : 9;
-
-    // Reveal holographic overlays on nearby tiles
     for (let dy = -scanRadius; dy <= scanRadius; dy++) {
       for (let dx = -scanRadius; dx <= scanRadius; dx++) {
         const r = pRow + dy;
         const c = pCol + dx;
-        if (r >= 0 && r < MAP_ROWS && c >= 0 && c < MAP_COLS) {
-          const dist = Math.hypot(dx, dy);
-          if (dist <= scanRadius) {
-            worldRef.current.tiles[r][c].scannedUntil = now + 4000;
-          }
+        if (r >= 0 && r < MAP_ROWS && c >= 0 && c < MAP_COLS && Math.hypot(dx, dy) <= scanRadius) {
+          world.tiles[r][c].scannedUntil = now + 4000;
         }
       }
     }
 
-    // Check exploration quest objective trigger
-    if (activeQuest && activeQuest.type === 'EXPLORATION' && activeQuest.targetCoordinates) {
-      const distToTarget = Math.hypot(
-        activeQuest.targetCoordinates.x - player.x,
-        activeQuest.targetCoordinates.y - player.y
-      );
-      if (distToTarget < 5.0) {
-        // Complete exploration quest
+    // Исследовательское задание: скан рядом с целью засчитывает его.
+    const quest = latestRef.current.activeQuest;
+    if (quest && quest.type === 'EXPLORATION' && quest.targetCoordinates) {
+      const distToTarget = Math.hypot(quest.targetCoordinates.x - player.x, quest.targetCoordinates.y - player.y);
+      if (distToTarget < QUEST_SCAN_RADIUS) {
         setNpcs(prevNpcs =>
           prevNpcs.map(n => ({
             ...n,
-            quests: n.quests.map(q =>
-              q.id === activeQuest.id
-                ? { ...q, progress: q.maxProgress }
-                : q
-            )
+            quests: n.quests.map(q => (q.id === quest.id ? { ...q, progress: q.maxProgress } : q))
           }))
         );
         sound.playDeliverySuccess();
       }
     }
 
-    setPlayer(prev => ({
+    updatePlayer(prev => ({
       ...prev,
       scannerActive: true,
       scannerPulseProgress: 0,
-      scannerCooldown: weather.type === 'ANOMALOUS_AURORA' ? 2000 : 3500
+      scannerCooldown: isAurora ? 2000 : 3500
     }));
-  }, [player.scannerCooldown, player.x, player.y, weather.type, activeQuest]);
+  }, [world, updatePlayer]);
 
-  // Handle Resource Harvesting
+  // Сбор ресурса рядом с курьером (клавиша F или кнопка): +15 лайков.
   const handleHarvestResource = () => {
     if (!nearbyResource) return;
 
     sound.playHarvest();
 
-    // Add collected resources to player
     setResources(prev => {
       const existing = prev.find(r => r.type === nearbyResource.type);
       if (existing) {
         return prev.map(r =>
           r.type === nearbyResource.type ? { ...r, count: r.count + nearbyResource.amount } : r
         );
-      } else {
-        const resInfo = ALL_RESOURCES[nearbyResource.type];
-        return [
-          ...prev,
-          {
-            type: nearbyResource.type,
-            name: nearbyResource.name,
-            count: nearbyResource.amount,
-            icon: resInfo.icon,
-            weightKg: resInfo.weightKg,
-            description: resInfo.description
-          }
-        ];
       }
+      const resInfo = ALL_RESOURCES[nearbyResource.type];
+      return [
+        ...prev,
+        {
+          type: nearbyResource.type,
+          name: nearbyResource.name,
+          count: nearbyResource.amount,
+          icon: resInfo.icon,
+          weightKg: resInfo.weightKg,
+          description: resInfo.description
+        }
+      ];
     });
 
-    // Mark node as harvested
-    setResourceNodes(prev =>
-      prev.map(n => (n.id === nearbyResource.id ? { ...n, harvested: true } : n))
-    );
+    harvestedIdsRef.current.add(nearbyResource.id);
+    setResourceNodes(prev => prev.map(n => (n.id === nearbyResource.id ? { ...n, harvested: true } : n)));
 
-    // Reward likes for gathering
-    setPlayer(prev => ({
-      ...prev,
-      totalLikes: prev.totalLikes + 15
-    }));
+    updatePlayer(prev => ({ ...prev, totalLikes: prev.totalLikes + 15 }));
   };
 
-  // Global Keyboard shortcuts: E (Station / NPC), F (Harvest)
+  // Клавиши: E — поговорить/открыть станцию, F — собрать ресурс.
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
@@ -971,7 +866,7 @@ export default function App() {
         if (nearbyStation && !stationModalStation && !dialogNPC && !pdaOpen) {
           setStationModalStation(nearbyStation);
         } else if (nearbyNPC && !dialogNPC && !stationModalStation && !pdaOpen) {
-          setDialogNPC(nearbyNPC);
+          openDialog(nearbyNPC);
         }
       } else if (e.code === 'KeyF') {
         if (nearbyResource && !nearbyResource.harvested) {
@@ -981,16 +876,17 @@ export default function App() {
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [nearbyStation, nearbyNPC, nearbyResource, stationModalStation, dialogNPC, pdaOpen]);
+  });
 
-  // Handle Tool Deployment (Ladder, Rope, Campfire, Thermos, Flare, Shelter)
+  // Использовать инструмент: термос выпивается, остальное ставится на землю под курьером.
   const handleUseTool = (toolId: string) => {
     const tool = tools.find(t => t.id === toolId);
     if (!tool || tool.count <= 0) return;
 
     if (tool.type === 'THERMAL_FLASK') {
+      // Термос: +45 тепла, +35 выносливости.
       sound.playThermosSip();
-      setPlayer(prev => ({
+      updatePlayer(prev => ({
         ...prev,
         warmth: Math.min(100, prev.warmth + 45),
         stamina: Math.min(prev.maxStamina, prev.stamina + 35)
@@ -1004,36 +900,25 @@ export default function App() {
       else if (tool.type === 'FLARE') structType = 'FLARE';
       else if (tool.type === 'BEACON') structType = 'BEACON';
 
-      const newStructure: PlacedStructure = {
-        id: `struct_${Date.now()}`,
-        type: structType,
-        x: player.x,
-        y: player.y
-      };
-      setStructures(prev => [...prev, newStructure]);
+      const { x, y } = playerRef.current;
+      setStructures(prev => [...prev, { id: `struct_${Date.now()}`, type: structType, x, y }]);
     }
 
-    // Decrement tool count
-    setTools(prev =>
-      prev.map(t => (t.id === toolId ? { ...t, count: t.count - 1 } : t))
-    );
+    setTools(prev => prev.map(t => (t.id === toolId ? { ...t, count: t.count - 1 } : t)));
   };
 
-  // Handle Crafting a Recipe
+  // Крафт: списать ингредиенты и выдать результат. За каждый крафт +35 лайков.
   const handleCraftRecipe = (recipe: CraftingRecipe) => {
-    // 1. Deduct ingredients
-    setResources(prev => {
-      return prev.map(r => {
+    setResources(prev =>
+      prev.map(r => {
         const ing = recipe.ingredients.find(i => i.type === r.type);
-        if (ing) {
-          return { ...r, count: Math.max(0, r.count - ing.amount) };
-        }
-        return r;
-      });
-    });
+        return ing ? { ...r, count: Math.max(0, r.count - ing.amount) } : r;
+      })
+    );
 
-    // 2. Grant result
     if (recipe.category === 'CLOTHING') {
+      // Одежда сразу надевается. Числа — сила эффекта (см. playerPhysics.ts):
+      // парка −35% замерзания, маска −35% раскачки ветром, ботинки −50% износа.
       if (recipe.resultType === 'GEAR_PARKA') {
         setEquippedGear(prev => ({
           ...prev,
@@ -1056,7 +941,7 @@ export default function App() {
         }));
       }
     } else if (recipe.category === 'TOOL' || recipe.category === 'SHELTER') {
-      // Add or increment tool item
+      // Инструмент добавляется в инвентарь (или увеличивается их количество).
       const toolMap: Record<string, ToolItem['type']> = {
         TOOL_SHELTER: 'SHELTER_KIT',
         TOOL_FLARE: 'FLARE',
@@ -1069,28 +954,25 @@ export default function App() {
       setTools(prev => {
         const existing = prev.find(t => t.type === mappedType);
         if (existing) {
-          return prev.map(t =>
-            t.type === mappedType ? { ...t, count: t.count + recipe.resultCount } : t
-          );
-        } else {
-          return [
-            ...prev,
-            {
-              id: `tool_${Date.now()}`,
-              name: recipe.name,
-              type: mappedType,
-              count: recipe.resultCount,
-              weightKg: 1.5,
-              icon: recipe.icon,
-              description: recipe.description
-            }
-          ];
+          return prev.map(t => (t.type === mappedType ? { ...t, count: t.count + recipe.resultCount } : t));
         }
+        return [
+          ...prev,
+          {
+            id: `tool_${Date.now()}`,
+            name: recipe.name,
+            type: mappedType,
+            count: recipe.resultCount,
+            weightKg: 1.5,
+            icon: recipe.icon,
+            description: recipe.description
+          }
+        ];
       });
     } else if (recipe.category === 'SURVIVAL') {
-      // Immediate buff consumable
+      // Расходник выживания применяется сразу: +50 тепла, +50 выносливости, +30 обуви.
       sound.playThermosSip();
-      setPlayer(prev => ({
+      updatePlayer(prev => ({
         ...prev,
         warmth: Math.min(100, prev.warmth + 50),
         stamina: Math.min(prev.maxStamina, prev.stamina + 50),
@@ -1098,14 +980,10 @@ export default function App() {
       }));
     }
 
-    // Award Likes for crafting
-    setPlayer(prev => ({
-      ...prev,
-      totalLikes: prev.totalLikes + 35
-    }));
+    updatePlayer(prev => ({ ...prev, totalLikes: prev.totalLikes + 35 }));
   };
 
-  // NPC Quest Acceptance
+  // Принять задание NPC.
   const handleAcceptQuest = (questId: string) => {
     sound.playQuestAccept();
     setNpcs(prev =>
@@ -1116,33 +994,25 @@ export default function App() {
     );
   };
 
-  // NPC Quest Turn-In
+  // Сдать задание NPC: списать требуемые ресурсы, выдать лайки и награды.
   const handleTurnInQuest = (questId: string) => {
     const targetQuest = npcs.flatMap(n => n.quests).find(q => q.id === questId);
     if (!targetQuest) return;
 
     sound.playQuestComplete();
 
-    // Deduct gathering resources if required
     if (targetQuest.requiredResources) {
       setResources(prev =>
         prev.map(r => {
           const req = targetQuest.requiredResources?.find(rr => rr.type === r.type);
-          if (req) {
-            return { ...r, count: Math.max(0, r.count - req.amount) };
-          }
-          return r;
+          return req ? { ...r, count: Math.max(0, r.count - req.amount) } : r;
         })
       );
     }
 
-    // Reward likes and items
-    setPlayer(prev => ({
-      ...prev,
-      totalLikes: prev.totalLikes + targetQuest.rewardLikes
-    }));
+    updatePlayer(prev => ({ ...prev, totalLikes: prev.totalLikes + targetQuest.rewardLikes }));
 
-    // Grant bonus reward items
+    // Предметы-награды пока выдаются как фальшфейеры с названием и иконкой награды.
     if (targetQuest.rewardItems) {
       targetQuest.rewardItems.forEach(item => {
         setTools(prev => [
@@ -1160,48 +1030,41 @@ export default function App() {
       });
     }
 
-    // Mark quest completed
     setNpcs(prev =>
       prev.map(n => ({
         ...n,
         quests: n.quests.map(q => (q.id === questId ? { ...q, status: 'COMPLETED' } : q))
       }))
     );
+    updateRelation(targetQuest.npcId, r => ({ ...r, questsCompleted: r.questsCompleted + 1 }));
   };
 
-  // NPC Trade: Buy
+  // Купить у NPC за лайки.
   const handleBuyTradeItem = (item: TradeItem) => {
-    if (player.totalLikes < item.priceLikes) return;
+    if (playerRef.current.totalLikes < item.priceLikes) return;
 
     sound.playTradeSuccess();
+    updatePlayer(prev => ({ ...prev, totalLikes: prev.totalLikes - item.priceLikes }));
 
-    // Deduct Likes
-    setPlayer(prev => ({
-      ...prev,
-      totalLikes: prev.totalLikes - item.priceLikes
-    }));
-
-    // Add item to inventory
     if (item.category === 'RESOURCE') {
       const resType = item.itemKey as ResourceItem['type'];
       setResources(prev => {
         const existing = prev.find(r => r.type === resType);
         if (existing) {
           return prev.map(r => (r.type === resType ? { ...r, count: r.count + 1 } : r));
-        } else {
-          const resInfo = ALL_RESOURCES[resType];
-          return [
-            ...prev,
-            {
-              type: resType,
-              name: item.name,
-              count: 1,
-              icon: item.icon,
-              weightKg: resInfo?.weightKg || 0.5,
-              description: item.description
-            }
-          ];
         }
+        const resInfo = ALL_RESOURCES[resType];
+        return [
+          ...prev,
+          {
+            type: resType,
+            name: item.name,
+            count: 1,
+            icon: item.icon,
+            weightKg: resInfo?.weightKg || 0.5,
+            description: item.description
+          }
+        ];
       });
     } else if (item.category === 'TOOL') {
       setTools(prev => [
@@ -1217,26 +1080,21 @@ export default function App() {
         }
       ]);
     }
+    if (dialogNpcId) updateRelation(dialogNpcId, r => ({ ...r, trades: r.trades + 1 }));
   };
 
-  // NPC Trade: Sell Resource
+  // Продать NPC ресурс за лайки.
   const handleSellResource = (resourceType: string, amount: number, priceLikes: number) => {
     const res = resources.find(r => r.type === resourceType);
     if (!res || res.count < amount) return;
 
     sound.playTradeSuccess();
-
-    setResources(prev =>
-      prev.map(r => (r.type === resourceType ? { ...r, count: r.count - amount } : r))
-    );
-
-    setPlayer(prev => ({
-      ...prev,
-      totalLikes: prev.totalLikes + priceLikes
-    }));
+    setResources(prev => prev.map(r => (r.type === resourceType ? { ...r, count: r.count - amount } : r)));
+    updatePlayer(prev => ({ ...prev, totalLikes: prev.totalLikes + priceLikes }));
+    if (dialogNpcId) updateRelation(dialogNpcId, r => ({ ...r, trades: r.trades + 1 }));
   };
 
-  // Handle Mission Acceptance from PDA
+  // Взять заказ в КПК: груз заказа кладётся в рюкзак, таймер заказа запускается.
   const handleAcceptMission = (missionId: string) => {
     const mission = missions.find(m => m.id === missionId);
     if (!mission) return;
@@ -1244,21 +1102,22 @@ export default function App() {
     setActiveMission(mission);
     setCargo(mission.cargoItems);
     missionStartTimeRef.current = Date.now();
-    setMissions(prev =>
-      prev.map(m => (m.id === missionId ? { ...m, status: 'IN_TRANSIT' } : m))
-    );
+    setMissions(prev => prev.map(m => (m.id === missionId ? { ...m, status: 'IN_TRANSIT' } : m)));
     setPdaOpen(false);
   };
 
-  // Handle Mission Delivery at Station
+  /**
+   * Сдать заказ на станции. Оценка:
+   *  S — груз цел в среднем на 90% и больше И уложились в срок заказа (бонус +300 лайков);
+   *  A — целость от 75% (бонус +150); B — от 50% (+50); C — меньше 50% (+50).
+   */
   const handleDeliverMission = () => {
     if (!activeMission || !stationModalStation) return;
 
     sound.playDeliverySuccess();
 
     const timeTaken = (Date.now() - missionStartTimeRef.current) / 1000;
-    const avgIntegrity =
-      cargo.reduce((a, b) => a + b.currentIntegrity, 0) / cargo.length;
+    const avgIntegrity = cargo.reduce((a, b) => a + b.currentIntegrity, 0) / cargo.length;
 
     let grade: 'S' | 'A' | 'B' | 'C' = 'B';
     if (avgIntegrity >= 90 && timeTaken < activeMission.timeLimitSec) {
@@ -1274,17 +1133,11 @@ export default function App() {
     const bonusLikes = grade === 'S' ? 300 : grade === 'A' ? 150 : 50;
     const totalLikesEarned = activeMission.rewardLikes + bonusLikes;
 
-    // Connect Station to Eurasia network
-    setStations(prev =>
-      prev.map(s => (s.id === stationModalStation.id ? { ...s, connected: true } : s))
-    );
+    // Станция подключается к сети «Евразия».
+    setStations(prev => prev.map(s => (s.id === stationModalStation.id ? { ...s, connected: true } : s)));
+    setMissions(prev => prev.map(m => (m.id === activeMission.id ? { ...m, status: 'COMPLETED' } : m)));
 
-    // Mark mission completed
-    setMissions(prev =>
-      prev.map(m => (m.id === activeMission.id ? { ...m, status: 'COMPLETED' } : m))
-    );
-
-    setPlayer(prev => ({
+    updatePlayer(prev => ({
       ...prev,
       totalLikes: prev.totalLikes + totalLikesEarned,
       deliveredDeliveries: prev.deliveredDeliveries + 1
@@ -1303,30 +1156,22 @@ export default function App() {
     setStationModalStation(null);
   };
 
-  // Rest and Refuel at Station
+  // Отдых на станции: все показатели до 100%.
   const handleRestAndRefuel = () => {
     sound.playThermosSip();
-    setPlayer(prev => ({
-      ...prev,
-      warmth: 100,
-      stamina: 100,
-      battery: 100,
-      bootsIntegrity: 100
-    }));
+    updatePlayer(prev => ({ ...prev, warmth: 100, stamina: 100, battery: 100, bootsIntegrity: 100 }));
   };
 
-  // Restock Tool at Station
+  // Пополнить инструмент на станции: +1 штука.
   const handleRestockTool = (toolType: ToolItem['type']) => {
     sound.playToolDeploy();
-    setTools(prev =>
-      prev.map(t => (t.type === toolType ? { ...t, count: t.count + 1 } : t))
-    );
+    setTools(prev => prev.map(t => (t.type === toolType ? { ...t, count: t.count + 1 } : t)));
   };
 
-  // Auto-arrange cargo stack for center of gravity stability
+  // Автоукладка груза: самый тяжёлый вниз рюкзака, дальше — наверх, на лямки, в середину.
+  // После укладки баланс выравнивается.
   const handleAutoArrangeCargo = () => {
     sound.playToolDeploy();
-    // Sort heavier items to bottom rack
     const sorted = [...cargo].sort((a, b) => b.weightKg - a.weightKg);
     const arranged = sorted.map((item, idx) => {
       let slot: CargoItem['slot'] = 'BACKPACK_MID';
@@ -1337,29 +1182,28 @@ export default function App() {
       return { ...item, slot };
     });
     setCargo(arranged);
-    setPlayer(prev => ({ ...prev, balance: 0 }));
+    updatePlayer(prev => ({ ...prev, balance: 0 }));
   };
 
-  // Repair Cargo with protective thermal foam
+  // Починить контейнер термопеной: целость до 100%.
   const handleRepairCargo = (cargoId: string) => {
     sound.playToolDeploy();
-    setCargo(prev =>
-      prev.map(c => (c.id === cargoId ? { ...c, currentIntegrity: 100 } : c))
-    );
+    setCargo(prev => prev.map(c => (c.id === cargoId ? { ...c, currentIntegrity: 100 } : c)));
   };
 
-  // Audio mute toggle
   const handleToggleMute = () => {
-    const muted = sound.toggleMute();
-    setIsMuted(muted);
+    setIsMuted(sound.toggleMute());
   };
 
+  // ======================================================================
+  // ЭКРАН: холст с миром и окна интерфейса поверх него
+  // ======================================================================
   return (
     <main
       id="game-viewport-container"
       className="relative w-screen h-screen overflow-hidden bg-neutral-950 font-mono-tech select-none"
     >
-      {/* HTML5 Pixel Art Game Canvas with direct touch/mouse control */}
+      {/* Холст, на котором рисуется мир. Касание/клик по нему ведёт курьера. */}
       <canvas
         ref={canvasRef}
         id="taiga-pixel-canvas"
@@ -1370,18 +1214,18 @@ export default function App() {
         className="w-full h-full block pixel-art touch-none cursor-pointer"
       />
 
-      {/* Retro CRT Scanline Overlay */}
+      {/* Эффект старого ЭЛТ-монитора (полосы развёртки) */}
       <div className="crt-overlay absolute inset-0 pointer-events-none" />
 
-      {/* Heads-Up Display (Vitals, Balance Bar, Weather, Quick Tools, Crafting, NPC/Harvest Prompts, Zoom & LOD Slider) */}
+      {/* HUD: шкалы выживания, баланс, погода, инструменты, подсказки, масштаб */}
       <GameHUD
-        player={player}
+        player={hudPlayer}
         cargo={cargo}
         activeMission={activeMission}
         weather={weather}
         tools={tools}
         resources={resources}
-        playerLikes={player.totalLikes}
+        playerLikes={hudPlayer.totalLikes}
         nearbyNPC={nearbyNPC}
         nearbyResource={nearbyResource}
         nearbyStation={nearbyStation}
@@ -1390,6 +1234,7 @@ export default function App() {
         zoom={zoom}
         onChangeZoom={handleZoomChange}
         onToggleMute={handleToggleMute}
+        onOpenMenu={() => setMenuOpen(true)}
         onOpenPDA={(tab) => {
           setPdaInitialTab(tab || 'MAP');
           setPdaOpen(true);
@@ -1397,7 +1242,7 @@ export default function App() {
         onOpenCargo={() => setCargoModalOpen(true)}
         onOpenCrafting={() => setCraftingModalOpen(true)}
         onInteractNPC={() => {
-          if (nearbyNPC) setDialogNPC(nearbyNPC);
+          if (nearbyNPC) openDialog(nearbyNPC);
         }}
         onHarvestResource={handleHarvestResource}
         onOpenStation={() => {
@@ -1406,33 +1251,24 @@ export default function App() {
         onUseTool={handleUseTool}
       />
 
-      {/* Mobile Virtual Controls (Joystick, L/R balance straps, Echo-4 scanner, Breath, Sprint) */}
+      {/* Экранные кнопки для телефона: джойстик, лямки [Л]/[П], сканер, дыхание, бег */}
       <VirtualControls
         onMove={(dx, dy) => {
           inputVectorRef.current = { x: dx, y: dy };
         }}
-        onBraceLeft={(active) => {
-          setPlayer(prev => ({ ...prev, isBracingLeft: active }));
-        }}
-        onBraceRight={(active) => {
-          setPlayer(prev => ({ ...prev, isBracingRight: active }));
-        }}
+        onBraceLeft={(active) => updatePlayer(prev => ({ ...prev, isBracingLeft: active }))}
+        onBraceRight={(active) => updatePlayer(prev => ({ ...prev, isBracingRight: active }))}
         onScan={handleScanPulse}
-        onHoldBreath={(active) => {
-          setPlayer(prev => ({ ...prev, isHoldingBreath: active }));
-        }}
-        onSprint={(active) => {
-          setPlayer(prev => ({ ...prev, isSprinting: active }));
-        }}
-        isHoldingBreath={player.isHoldingBreath}
-        isBracingLeft={player.isBracingLeft}
-        isBracingRight={player.isBracingRight}
-        isSprinting={player.isSprinting}
-        scannerCooldown={player.scannerCooldown}
-        stumbleAlert={player.stumbleAlert}
+        onHoldBreath={(active) => updatePlayer(prev => ({ ...prev, isHoldingBreath: active }))}
+        onSprint={(active) => updatePlayer(prev => ({ ...prev, isSprinting: active }))}
+        isHoldingBreath={hudPlayer.isHoldingBreath}
+        isBracingLeft={hudPlayer.isBracingLeft}
+        isBracingRight={hudPlayer.isBracingRight}
+        isSprinting={hudPlayer.isSprinting}
+        scannerCooldown={hudPlayer.scannerCooldown}
+        stumbleAlert={hudPlayer.stumbleAlert}
       />
 
-      {/* Crafting System Modal */}
       {craftingModalOpen && (
         <CraftingModal
           resources={resources}
@@ -1442,37 +1278,69 @@ export default function App() {
         />
       )}
 
-      {/* NPC Dialogue, Quests & Trading Modal */}
       {dialogNPC && (
         <NPCDialogModal
           npc={dialogNPC}
-          playerLikes={player.totalLikes}
+          playerLikes={hudPlayer.totalLikes}
           resources={resources}
           tools={tools}
           onAcceptQuest={handleAcceptQuest}
           onTurnInQuest={handleTurnInQuest}
           onBuyItem={handleBuyTradeItem}
           onSellResource={handleSellResource}
-          onClose={() => setDialogNPC(null)}
+          onClose={() => setDialogNpcId(null)}
         />
       )}
 
-      {/* PDA Field Computer Modal */}
       {pdaOpen && (
         <DeliveryPDA
           initialTab={pdaInitialTab}
-          player={player}
+          player={hudPlayer}
           stations={stations}
           missions={missions}
           structures={structures}
           activeMission={activeMission}
           discoveredRegionIds={discoveredRegionIds}
+          journalEntries={journalEntries}
           onAcceptMission={handleAcceptMission}
           onClose={() => setPdaOpen(false)}
         />
       )}
 
-      {/* Region Discovery & Lore Unlocked Floating Notification */}
+      {menuOpen && (
+        <GameMenuModal
+          lastSavedAt={lastSavedAt}
+          savingDisabledReason={savingDisabledReason}
+          onSaveNow={() => {
+            if (persistGame()) setMenuOpen(false);
+          }}
+          onRestart={handleRestartGame}
+          onClose={() => setMenuOpen(false)}
+        />
+      )}
+
+      {/* Сообщение о сохранении (обновлено, повреждено, не удалось записать) */}
+      {saveNotice && (
+        <aside
+          aria-label="Сообщение о сохранении"
+          className="fixed bottom-24 left-1/2 -translate-x-1/2 z-40 max-w-md w-[92%] bg-neutral-950/95 border-2 border-amber-500/80 rounded-2xl p-3.5 shadow-xl backdrop-blur-md flex items-start justify-between gap-3 font-mono-tech select-none"
+        >
+          <div className="flex items-start gap-3">
+            <Save className="w-5 h-5 text-amber-300 shrink-0 mt-0.5" />
+            <div className="text-[11px] text-amber-100 leading-relaxed">{saveNotice}</div>
+          </div>
+          <button
+            type="button"
+            onClick={() => setSaveNotice(null)}
+            className="p-1.5 text-neutral-400 hover:text-white text-xs transition-colors"
+            aria-label="Закрыть"
+          >
+            ✕
+          </button>
+        </aside>
+      )}
+
+      {/* Всплывающее уведомление об открытии нового региона */}
       {regionDiscoveryAlert && (
         <aside
           aria-label="Уведомление об открытии региона"
@@ -1522,7 +1390,6 @@ export default function App() {
         </aside>
       )}
 
-      {/* Cargo Management & Weight Distribution Modal */}
       {cargoModalOpen && (
         <CargoInventoryModal
           cargo={cargo}
@@ -1534,7 +1401,6 @@ export default function App() {
         />
       )}
 
-      {/* Station Terminal Outpost Modal */}
       {stationModalStation && (
         <StationTerminalModal
           station={stationModalStation}
@@ -1547,7 +1413,6 @@ export default function App() {
         />
       )}
 
-      {/* Delivery Evaluation Report Modal */}
       {deliveryReport && (
         <DeliveryReportModal
           mission={deliveryReport.mission}
@@ -1561,4 +1426,3 @@ export default function App() {
     </main>
   );
 }
-

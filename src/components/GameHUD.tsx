@@ -11,6 +11,7 @@ import {
   PlacedStructure
 } from '../types/game';
 import {
+  Settings,
   Volume2,
   VolumeX,
   MapPin,
@@ -50,6 +51,7 @@ interface GameHUDProps {
   zoom?: number;
   onChangeZoom?: (zoom: number) => void;
   onToggleMute: () => void;
+  onOpenMenu: () => void;
   onOpenPDA: (tab?: 'MAP' | 'MISSIONS' | 'NETWORK' | 'JOURNAL' | 'HANDBOOK') => void;
   onOpenCargo: () => void;
   onOpenCrafting: () => void;
@@ -75,6 +77,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   zoom = 1.0,
   onChangeZoom,
   onToggleMute,
+  onOpenMenu,
   onOpenPDA,
   onOpenCargo,
   onOpenCrafting,
@@ -419,6 +422,17 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                 title={isMuted ? 'Включить звук' : 'Выключить звук'}
               >
                 {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
+              </button>
+
+              {/* Меню игры: сохранение и «Начать заново» */}
+              <button
+                id="btn-open-game-menu"
+                type="button"
+                onClick={onOpenMenu}
+                className="p-1.5 rounded-md bg-neutral-900 border border-neutral-700 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800 transition-colors"
+                title="Меню игры"
+              >
+                <Settings className="w-4 h-4 text-neutral-300" />
               </button>
             </div>
 

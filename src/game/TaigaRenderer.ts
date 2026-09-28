@@ -50,6 +50,16 @@ export class TaigaRenderer {
     return this.zoom;
   }
 
+  /**
+   * Попадает ли точка (в пикселях мира относительно камеры) на экран с запасом margin пикселей.
+   * Запас нужен, чтобы крупные спрайты не «обрезались» у края, пока их центр ещё за экраном.
+   */
+  private isOnScreen(sx: number, sy: number, margin: number): boolean {
+    const viewWidth = this.canvas.width / this.zoom;
+    const viewHeight = this.canvas.height / this.zoom;
+    return sx >= -margin && sx <= viewWidth + margin && sy >= -margin && sy <= viewHeight + margin;
+  }
+
   public render(
     tiles: WorldTile[][],
     player: PlayerStats,
@@ -1529,6 +1539,7 @@ export class TaigaRenderer {
       if (node.harvested) continue;
       const sx = node.x * TILE_SIZE - cameraX;
       const sy = node.y * TILE_SIZE - cameraY;
+      if (!this.isOnScreen(sx, sy, 60)) continue; // за экраном — не рисуем
       const distToPlayer = Math.hypot(node.x - player.x, node.y - player.y);
 
       // Render resource pixel-art sprite according to type (Ref Screenshots 1, 2, 3)
@@ -1729,6 +1740,7 @@ export class TaigaRenderer {
     for (const npc of npcs) {
       const sx = npc.x * TILE_SIZE - cameraX;
       const sy = npc.y * TILE_SIZE - cameraY;
+      if (!this.isOnScreen(sx, sy, 80)) continue; // за экраном — не рисуем
       const distToPlayer = Math.hypot(npc.x - player.x, npc.y - player.y);
 
       // Pixel-art character sprite
