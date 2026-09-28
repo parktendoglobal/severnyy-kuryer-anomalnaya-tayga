@@ -1,3 +1,7 @@
+/**
+ * Итоговый экран после сдачи заказа: оценка S/A/B/C, время в пути, средняя целостность груза
+ * и заработанные лайки. Оценку считает App.tsx (handleDeliverMission), здесь она только показывается.
+ */
 import React from 'react';
 import { DeliveryMission, CargoItem } from '../types/game';
 import { CheckCircle2, Award, Heart, ThumbsUp, Sparkles, ArrowRight } from 'lucide-react';

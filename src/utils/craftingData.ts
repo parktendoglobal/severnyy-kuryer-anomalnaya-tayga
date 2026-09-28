@@ -1,5 +1,11 @@
+/**
+ * Всё о крафте: какие бывают ресурсы (вес, иконка, описание), с какими ресурсами курьер
+ * начинает игру и список рецептов (что из чего делается и что даёт).
+ * Рецепты общие для всего мира, поэтому не разбиты по регионам.
+ */
 import { CraftingRecipe, ResourceItem, ResourceType } from '../types/game';
 
+// Справочник ресурсов. weightKg — вес ОДНОЙ единицы (10 поленьев по 0.8 кг = 8 кг в рюкзаке).
 export const ALL_RESOURCES: Record<ResourceType, { name: string; icon: string; weightKg: number; description: string }> = {
   WOOD_PINE: {
     name: 'Кедровая древесина',
@@ -45,6 +51,7 @@ export const ALL_RESOURCES: Record<ResourceType, { name: string; icon: string; w
   }
 };
 
+// С какими ресурсами курьер начинает новую игру (count — сколько единиц).
 export const INITIAL_PLAYER_RESOURCES: ResourceItem[] = [
   {
     type: 'WOOD_PINE',
@@ -104,6 +111,12 @@ export const INITIAL_PLAYER_RESOURCES: ResourceItem[] = [
   }
 ];
 
+/**
+ * Рецепты. ingredients — что тратится, resultCount — сколько получается.
+ * ВАЖНО: текст benefits только описывает эффект для игрока, а настоящие числа эффекта задаются
+ * в App.tsx (handleCraftRecipe) по коду resultType: например, GEAR_PARKA там даёт −35% замерзания.
+ * Если меняете эффект в описании, поменяйте и число там. Поле unlocked пока не используется.
+ */
 export const CRAFTING_RECIPES: CraftingRecipe[] = [
   // 1. WARM CLOTHING & UPGRADES
   {

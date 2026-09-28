@@ -1,3 +1,8 @@
+/**
+ * Вкладка «Дневник исследователя» в КПК: список записей о регионах, аномалиях и экспедициях
+ * с поиском и фильтрами, и подробная карточка выбранной записи. Записи региона открываются,
+ * когда курьер впервые в него входит; записи ещё не открытых регионов показаны под замком.
+ */
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { JournalEntry, JournalCategory } from '../types/journal';
 import { REGIONS, getRegionAt } from '../content/regionMap';
