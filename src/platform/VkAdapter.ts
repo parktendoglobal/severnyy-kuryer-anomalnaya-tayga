@@ -1,5 +1,5 @@
-import { CloudSaveAdapter } from './CloudSaveAdapter';
-import { KeyValueStore, loadScript } from './storage';
+import { PlatformAdapter } from './types';
+import { CloudSaves, KeyValueStore, loadScript } from './storage';
 
 const SDK_URL = 'https://unpkg.com/@vkontakte/vk-bridge/dist/browser.min.js';
 
@@ -13,9 +13,10 @@ declare global {
   }
 }
 
-/** VK Mini App: saves go to VK Storage (VKWebAppStorageGet / VKWebAppStorageSet). */
-export class VkAdapter extends CloudSaveAdapter {
+/** Мини-приложение VK: копия сохранения лежит в VK Storage (VKWebAppStorageGet / Set). */
+export class VkAdapter implements PlatformAdapter {
   readonly id = 'vk' as const;
+  private readonly cloud = new CloudSaves(() => this.store());
 
   private get bridge(): VkBridge | undefined {
     return window.vkBridge;
@@ -26,7 +27,11 @@ export class VkAdapter extends CloudSaveAdapter {
     await this.bridge?.send('VKWebAppInit');
   }
 
-  protected cloud(): KeyValueStore | null {
+  pullSave() { return this.cloud.pull(); }
+  pushSave(raw: string) { return this.cloud.push(raw); }
+  clearSave() { return this.cloud.clear(); }
+
+  private store(): KeyValueStore | null {
     const bridge = this.bridge;
     if (!bridge) return null;
     return {
@@ -34,7 +39,7 @@ export class VkAdapter extends CloudSaveAdapter {
         const res = await bridge.send('VKWebAppStorageGet', { keys });
         const out: Record<string, string> = {};
         for (const { key, value } of (res?.keys ?? []) as { key: string; value: string }[]) {
-          // VK returns '' for keys that were never set
+          // Для ключей, которые ни разу не записывали, VK возвращает ''
           if (value !== '') out[key] = value;
         }
         return out;

@@ -1,24 +1,37 @@
-// Authentic Handcrafted Pixel-Art Siberian Spruce Sprite Generator
-// Faithfully matches the user's reference pixel-art spruce:
-// - Low-resolution chunky pixel grid with bold slate-navy outline
-// - Plump, rounded scalloped silhouette with cozy, stout proportions
-// - Rich pine-green foliage with warm sunlit olive highlights
-// - Puffy, pillow-soft snow banks resting on boughs with blue cast shadows
-// - Stout, barrel-like wooden trunk resting in a stepped pixelated ground shadow
+/*
+ * ПИКСЕЛЬНАЯ ЕЛЬ (картинка дерева для тайги).
+ * Здесь нет файлов-картинок: каждая ель «нарисована» прямо в коде текстом — сеткой из символов,
+ * где один символ = один пиксель, а буква означает цвет (см. PALETTE ниже). При первом запросе
+ * код один раз переводит эти сетки в невидимые холсты (canvas) в памяти и запоминает их (кэш),
+ * дальше все деревья на карте рисуются копированием уже готовой картинки — это быстро.
+ * Случайности нет: сетки зафиксированы, поэтому ель всегда выглядит одинаково.
+ * Рендерер тайги (TaigaRenderer.ts, функция рисования ели) берёт отсюда картинку, ставит её
+ * «опорной точкой» (основанием ствола) в клетку карты, слегка покачивает верхушку на ветру
+ * и при желании подсвечивает бок тёплым светом костра.
+ */
 
+// Одна готовая картинка ели: сам холст и «опорная точка» — пиксель внутри картинки
+// (центр основания ствола), который ставится точно в нужное место на карте.
 export interface SpruceSpriteDef {
   canvas: HTMLCanvasElement;
   anchorX: number; // Pivot X (trunk base center)
   anchorY: number; // Pivot Y (trunk ground contact)
 }
 
+// Набор из трёх елей: две обычные (A и B — рендерер чередует их по клеткам карты,
+// чтобы лес не выглядел однообразным) и большая «вековая» ель.
 export interface SpruceSpriteSet {
   spruceA: SpruceSpriteDef;
   spruceB: SpruceSpriteDef;
   giantSpruce: SpruceSpriteDef;
 }
 
-// 16-color authentic pixel-art palette matched to reference
+// Палитра: какой символ сетки каким цветом рисовать (цвета в формате #RRGGBB).
+// '.' — прозрачно (пустота вокруг дерева). Роли цветов: '#' — тёмный контур;
+// G/g/L/l — хвоя от самой тёмной тени до светлых кончиков; W/s/S/d/D — снег от белого
+// к голубовато-серой тени; t/T/m/h — ствол от тёмных трещин к светлой коре;
+// O/o/p — полупрозрачная тень на снегу под деревом (последнее число в rgba — непрозрачность:
+// 0.42 = почти наполовину видна, 0.18 = еле заметна).
 const PALETTE: Record<string, string> = {
   '.': 'transparent',
   '#': '#1A2531', // Bold pixel outline (deep slate navy)
@@ -40,6 +53,8 @@ const PALETTE: Record<string, string> = {
   'p': 'rgba(152, 174, 196, 0.18)', // Outer soft snow shadow rim
 };
 
+// Переводит текстовую сетку в картинку: для каждого символа закрашивает один пиксель
+// его цветом из палитры. Сглаживание выключено, чтобы пиксели оставались чёткими «квадратиками».
 function buildCanvasFromGrid(lines: string[]): HTMLCanvasElement {
   const h = lines.length;
   const w = lines[0].length;
@@ -65,7 +80,10 @@ function buildCanvasFromGrid(lines: string[]): HTMLCanvasElement {
 }
 
 // ===========================================================================
-// SPRUCE A: Exact recreation of user's reference pixel art (46 x 52 px)
+// ЕЛЬ A — основная обычная ель, 46 пикселей в ширину и 52 в высоту.
+// Каждая строка в кавычках — одна строка пикселей; число в /* 00 */ — номер строки сверху.
+// Любые числа позиций в этом файле — это координаты пикселей внутри такой картинки.
+// Сверху вниз: снежная верхушка, ярусы веток с сугробами, ствол, тень на снегу.
 // ===========================================================================
 const SPRUCE_A_GRID: string[] = [
   /* 00 */ "..............................................",
@@ -123,8 +141,9 @@ const SPRUCE_A_GRID: string[] = [
 ];
 
 // ===========================================================================
-// SPRUCE B: Natural variation matching exact reference style (46 x 52 px)
-// Slightly different snow drift weighting, identical charm and proportions
+// ЕЛЬ B — второй вариант обычной ели, тот же размер 46 × 52.
+// Сейчас сетка B совпадает с A пиксель в пиксель; её можно подправить (например,
+// сугробы), чтобы соседние деревья в лесу отличались.
 // ===========================================================================
 const SPRUCE_B_GRID: string[] = [
   /* 00 */ "..............................................",
@@ -182,8 +201,8 @@ const SPRUCE_B_GRID: string[] = [
 ];
 
 // ===========================================================================
-// GIANT SPRUCE: Majestic Ancient Taiga Fir (58 x 66 px)
-// Scales the reference's stout, cozy pixel art to a majestic forest elder
+// ВЕКОВАЯ (БОЛЬШАЯ) ЕЛЬ — 58 пикселей в ширину и 56 в высоту (строки 00–55).
+// Тот же стиль и палитра, но крупнее: шире ярусы, толще ствол, больше тень.
 // ===========================================================================
 const GIANT_SPRUCE_GRID: string[] = [
   /* 00 */ "..........................................................",
@@ -244,9 +263,12 @@ const GIANT_SPRUCE_GRID: string[] = [
   /* 55 */ "..........................................................",
 ];
 
-// Cached singleton sprite set
+// Кэш: готовые картинки создаются один раз и дальше переиспользуются
 let cachedSprites: SpruceSpriteSet | null = null;
 
+// Главная функция файла: возвращает три готовые ели (при первом вызове рисует их, потом отдаёт из кэша).
+// anchorX/anchorY — координаты опорной точки в пикселях: для обычных елей (23, 45) —
+// середина ширины (46 / 2) и строка, где ствол стоит на снегу; для большой — (29, 48).
 export function getSpruceSprites(): SpruceSpriteSet {
   if (!cachedSprites) {
     cachedSprites = {

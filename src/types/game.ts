@@ -1,3 +1,9 @@
+/**
+ * Словарь игры: описания того, из каких полей состоит каждая игровая вещь — клетка карты, груз,
+ * инструмент, аномалия, погода, NPC, задание, станция, заказ, показатели курьера.
+ * Здесь нет логики, только «анкеты». Если добавить поле сюда, редактор кода подскажет все места,
+ * где его нужно заполнить.
+ */
 export type TileType =
   | 'SNOW_HARD'
   | 'SNOW_DEEP'
@@ -12,9 +18,9 @@ export type TerrainDanger = 'SAFE' | 'ROUGH' | 'HAZARDOUS';
 
 export interface WorldTile {
   type: TileType;
-  elevation: number; // 0 to 5
+  elevation: number; // высота 0–4, влияет только на оттенок клетки
   tree?: 'PINE' | 'BIRCH' | 'DEAD_TREE' | 'BUSH' | 'GIANT_PINE' | 'RED_BERRY_BUSH' | 'LARCH';
-  scannedUntil?: number;
+  scannedUntil?: number; // до какого момента (мс, performance.now) клетка подсвечена сканером
 }
 
 export type CargoCategory = 
@@ -81,6 +87,30 @@ export interface AnomalyEntity {
   state: 'PATROLLING' | 'ALERT' | 'HUNTING';
   driftAngle: number;
   pulseTimer: number;
+  // Сюжетная аномалия: её поведение считается всегда, даже вдали от игрока
+  // (см. src/game/activityZone.ts). Обычным аномалиям ставить не нужно.
+  alwaysActive?: boolean;
+  // Служебное поле: игровое время (в секундах), когда аномалию последний раз
+  // полноценно обновляли. Нужно, чтобы «догнать» её поведение, когда игрок вернётся.
+  lastSimulatedAt?: number;
+}
+
+// Потерянный груз, лежащий в тайге.
+export interface LostCache {
+  id: string;
+  x: number;
+  y: number;
+  name: string;
+  weightKg: number;
+  category: string;
+}
+
+// Атмосферный ориентир (памятник, мост, вышка). Пока только справочная информация.
+export interface Landmark {
+  x: number;
+  y: number;
+  name: string;
+  icon: string;
 }
 
 export interface Footstep {
@@ -274,7 +304,7 @@ export interface PlayerStats {
   isCrouching: boolean;
 
   // Scanner "Эхо-4"
-  scannerCooldown: number;
+  scannerCooldown: number; // сколько миллисекунд до следующего импульса (0 — готов)
   scannerPulseProgress: number; // 0 to 1 (active scanning wave radius)
   scannerActive: boolean;
 

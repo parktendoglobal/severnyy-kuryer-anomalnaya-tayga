@@ -1,3 +1,8 @@
+/**
+ * Окно разговора с жителем тайги (NPC): приветствие, его задания (взять, сдать) и торговля
+ * (купить за лайки, продать собранные ресурсы). Решения о наградах принимает App.tsx,
+ * окно только показывает варианты и сообщает о нажатиях.
+ */
 import React, { useState } from 'react';
 import { WorldNPC, NPCQuest, TradeItem, ResourceItem, ToolItem } from '../types/game';
 import { X, MessageSquare, ShoppingBag, Award, CheckCircle2, MapPin, Sparkles, Coins, PackageCheck, AlertCircle } from 'lucide-react';
@@ -337,6 +342,7 @@ export const NPCDialogModal: React.FC<NPCDialogModalProps> = ({
 
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
                   {resources.filter(r => r.count > 0).map(res => {
+                    // Цена продажи: 60 лайков за килограмм веса единицы ресурса, но не меньше 30.
                     const sellPrice = Math.max(30, Math.round(res.weightKg * 60));
 
                     return (

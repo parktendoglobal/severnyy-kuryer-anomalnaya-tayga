@@ -1,5 +1,5 @@
-import { PlatformAdapter, SaveState } from './types';
-import { loadScript, parseSave, readLocal, writeLocal } from './storage';
+import { PlatformAdapter } from './types';
+import { loadScript } from './storage';
 
 const SDK_URL = 'https://st.max.ru/js/max-web-app.js';
 
@@ -16,8 +16,8 @@ declare global {
 }
 
 /**
- * MAX mini app. Saves stay in the WebView's localStorage — swap in MAX's cloud
- * storage here once the game needs cross-device progress on MAX.
+ * Мини-приложение MAX. Облачной копии пока нет — сохранение живёт в памяти браузера
+ * внутри MAX. Облако можно подключить здесь, когда понадобится перенос прогресса между устройствами.
  */
 export class MaxAdapter implements PlatformAdapter {
   readonly id = 'max' as const;
@@ -28,11 +28,7 @@ export class MaxAdapter implements PlatformAdapter {
     window.WebApp?.expand?.();
   }
 
-  async save(state: SaveState): Promise<void> {
-    writeLocal(JSON.stringify(state));
-  }
-
-  async load(): Promise<SaveState | null> {
-    return parseSave(readLocal());
-  }
+  async pullSave(): Promise<string | null> { return null; }
+  async pushSave(): Promise<void> {}
+  async clearSave(): Promise<void> {}
 }

@@ -1,5 +1,5 @@
-import { CloudSaveAdapter } from './CloudSaveAdapter';
-import { KeyValueStore, loadScript } from './storage';
+import { PlatformAdapter } from './types';
+import { CloudSaves, KeyValueStore, loadScript } from './storage';
 
 const SDK_URL = 'https://telegram.org/js/telegram-web-app.js';
 
@@ -24,9 +24,10 @@ declare global {
   }
 }
 
-/** Telegram Mini App: saves go to Telegram CloudStorage (synced across the user's devices). */
-export class TelegramAdapter extends CloudSaveAdapter {
+/** Мини-приложение Telegram: копия сохранения лежит в Telegram CloudStorage. */
+export class TelegramAdapter implements PlatformAdapter {
   readonly id = 'telegram' as const;
+  private readonly cloud = new CloudSaves(() => this.store());
 
   private get webApp(): TelegramWebApp | undefined {
     return window.Telegram?.WebApp;
@@ -38,14 +39,18 @@ export class TelegramAdapter extends CloudSaveAdapter {
     if (!wa) return;
     wa.ready();
     wa.expand();
-    // Stop vertical swipes (joystick drags) from collapsing the mini app
+    // Иначе свайп по джойстику вниз сворачивает мини-приложение
     wa.disableVerticalSwipes?.();
   }
 
-  protected cloud(): KeyValueStore | null {
+  pullSave() { return this.cloud.pull(); }
+  pushSave(raw: string) { return this.cloud.push(raw); }
+  clearSave() { return this.cloud.clear(); }
+
+  private store(): KeyValueStore | null {
     const wa = this.webApp;
     const cs = wa?.CloudStorage;
-    // CloudStorage exists from Bot API 6.9
+    // CloudStorage появился в Bot API 6.9
     if (!cs || (wa.isVersionAtLeast && !wa.isVersionAtLeast('6.9'))) return null;
     return {
       get: keys =>

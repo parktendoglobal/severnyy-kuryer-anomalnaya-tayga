@@ -1,7 +1,18 @@
+/*
+ * ВСПОМОГАТЕЛЬНЫЙ СКРИПТ: сохраняет пиксельную ель A в PNG-файлы, чтобы её можно было
+ * посмотреть или показать вне игры. В самой игре эти файлы не нужны — там ель рисуется кодом
+ * (src/game/SpruceSprite.ts).
+ * Создаёт в папке public/: spruce.png (оригинал 46 × 52 пикселя), spruce_x4.png (увеличение в 4 раза,
+ * 184 × 208) и spruce_x8.png (в 8 раз, 368 × 416) — пиксели при увеличении остаются чёткими квадратами.
+ * Запуск из папки проекта: node scripts/export_spruce_png.cjs
+ * Если меняете рисунок ели в SpruceSprite.ts — скопируйте сюда ту же сетку и палитру, иначе PNG устареет.
+ */
 const fs = require('fs');
 const zlib = require('zlib');
 const path = require('path');
 
+// Контрольная сумма CRC32 — обязательная «подпись» каждого блока внутри PNG-файла.
+// Числа 0xEDB88320, 256, 8 — часть стандартного алгоритма, их менять нельзя.
 function crc32(buf) {
   let table = new Uint32Array(256);
   for (let i = 0; i < 256; i++) {
@@ -14,6 +25,7 @@ function crc32(buf) {
   return (crc ^ (-1)) >>> 0;
 }
 
+// Собирает один блок («чанк») PNG: длина + тип (4 буквы) + данные + контрольная сумма
 function makeChunk(type, data) {
   const len = Buffer.alloc(4);
   len.writeUInt32BE(data.length, 0);
@@ -23,6 +35,8 @@ function makeChunk(type, data) {
   return Buffer.concat([len, typeAndData, crc]);
 }
 
+// Собирает весь PNG-файл из массива пикселей (по 4 байта на пиксель: красный, зелёный,
+// синий, прозрачность — каждый 0–255). Первые 8 байт — стандартная «подпись» PNG-формата.
 function createPng(width, height, rgbaBuffer) {
   const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
   const ihdr = Buffer.alloc(13);
@@ -47,7 +61,7 @@ function createPng(width, height, rgbaBuffer) {
   return Buffer.concat([sig, ihdrChunk, idatChunk, iendChunk]);
 }
 
-// Parse hex/rgba to [r, g, b, a]
+// Переводит цвет из палитры ('#RRGGBB' или 'rgba(r, g, b, a)') в четыре числа 0–255; прозрачность 0–1 умножается на 255
 function parseColor(str) {
   if (!str || str === 'transparent') return [0, 0, 0, 0];
   if (str.startsWith('#')) {
@@ -73,7 +87,7 @@ function parseColor(str) {
   return [0, 0, 0, 0];
 }
 
-// 16-color authentic pixel-art palette matched to reference
+// Палитра — точная копия PALETTE из src/game/SpruceSprite.ts (символ сетки → цвет)
 const PALETTE = {
   '.': 'transparent',
   '#': '#1A2531', // Bold pixel outline
@@ -95,6 +109,7 @@ const PALETTE = {
   'p': 'rgba(152, 174, 196, 0.18)', // Outer soft snow shadow rim
 };
 
+// Сетка ели A — точная копия SPRUCE_A_GRID из src/game/SpruceSprite.ts (один символ = один пиксель)
 const SPRUCE_A_GRID = [
   "..............................................",
   "......................##......................",
@@ -150,6 +165,7 @@ const SPRUCE_A_GRID = [
   "..............................................",
 ];
 
+// Превращает сетку в массив пикселей; scale — во сколько раз увеличить (каждый пиксель становится квадратом scale × scale)
 function gridToRgba(lines, scale = 1) {
   const srcH = lines.length;
   const srcW = lines[0].length;
@@ -177,19 +193,19 @@ function gridToRgba(lines, scale = 1) {
   return { width: dstW, height: dstH, buffer: buf };
 }
 
-// 1. Export 1x spruce.png
+// 1. Оригинальный размер: spruce.png (46 × 52)
 const img1x = gridToRgba(SPRUCE_A_GRID, 1);
 const png1x = createPng(img1x.width, img1x.height, img1x.buffer);
 fs.writeFileSync(path.join(__dirname, '../public/spruce.png'), png1x);
 console.log('Created public/spruce.png (', img1x.width, 'x', img1x.height, ')');
 
-// 2. Export 4x spruce_x4.png (for high-res pixel-crisp viewing)
+// 2. Увеличение ×4: spruce_x4.png — для удобного просмотра
 const img4x = gridToRgba(SPRUCE_A_GRID, 4);
 const png4x = createPng(img4x.width, img4x.height, img4x.buffer);
 fs.writeFileSync(path.join(__dirname, '../public/spruce_x4.png'), png4x);
 console.log('Created public/spruce_x4.png (', img4x.width, 'x', img4x.height, ')');
 
-// 3. Export 8x spruce_x8.png (crystal clear preview)
+// 3. Увеличение ×8: spruce_x8.png — крупное превью
 const img8x = gridToRgba(SPRUCE_A_GRID, 8);
 const png8x = createPng(img8x.width, img8x.height, img8x.buffer);
 fs.writeFileSync(path.join(__dirname, '../public/spruce_x8.png'), png8x);

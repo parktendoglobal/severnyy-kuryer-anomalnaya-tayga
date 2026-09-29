@@ -1,17 +1,10 @@
-import { PlatformAdapter, SaveState } from './types';
-import { parseSave, readLocal, writeLocal } from './storage';
+import { PlatformAdapter } from './types';
 
-/** Plain browser / GitHub Pages: localStorage only. */
+/** Обычный браузер и GitHub Pages: облака нет, всё хранит saveSystem в памяти браузера. */
 export class StandaloneAdapter implements PlatformAdapter {
   readonly id = 'standalone' as const;
-
   async init(): Promise<void> {}
-
-  async save(state: SaveState): Promise<void> {
-    writeLocal(JSON.stringify(state));
-  }
-
-  async load(): Promise<SaveState | null> {
-    return parseSave(readLocal());
-  }
+  async pullSave(): Promise<string | null> { return null; }
+  async pushSave(): Promise<void> {}
+  async clearSave(): Promise<void> {}
 }

@@ -1,3 +1,7 @@
+/**
+ * Окно груза: что лежит в рюкзаке и на лямках, общий вес, целостность каждого контейнера,
+ * предупреждение о неустойчивой укладке, кнопки «Автоукладка» и «Починить».
+ */
 import React from 'react';
 import { CargoItem, ToolItem } from '../types/game';
 import { X, Package, Shield, Sparkles, Scale, AlertTriangle, RefreshCw } from 'lucide-react';
@@ -21,10 +25,13 @@ export const CargoInventoryModal: React.FC<CargoInventoryModalProps> = ({
 }) => {
   const totalCargoKg = cargo.reduce((acc, c) => acc + c.weightKg, 0);
   const totalToolsKg = tools.reduce((acc, t) => acc + t.weightKg * t.count, 0);
+  // Вес округляется до 0.1 кг. Здесь считается груз и инструменты, без собранных ресурсов
+  // (полный вес со всем — в HUD и в playerPhysics.ts).
   const totalWeight = Math.round((totalCargoKg + totalToolsKg) * 10) / 10;
   const weightPercent = Math.min(100, Math.round((totalWeight / maxWeightKg) * 100));
 
-  // Compute cargo stack stability based on bottom vs top weight
+  // Устойчивость укладки: если сверху рюкзака лежит на 5+ кг больше, чем снизу,
+  // укладка считается «перевёрнутой» и показывается предупреждение.
   const bottomWeight = cargo.filter(c => c.slot === 'BACKPACK_BOTTOM').reduce((a, b) => a + b.weightKg, 0);
   const topWeight = cargo.filter(c => c.slot === 'BACKPACK_TOP').reduce((a, b) => a + b.weightKg, 0);
   const isTopHeavy = topWeight > bottomWeight + 5;

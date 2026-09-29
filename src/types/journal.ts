@@ -1,3 +1,7 @@
+/**
+ * Словарь «Дневника исследователя»: из каких полей состоит запись дневника и карточка региона.
+ * Сами записи лежат в файлах регионов (src/content/regions/), карточки регионов — в src/content/regionMap.ts.
+ */
 export type JournalCategory = 'LORE' | 'PHENOMENON' | 'EXPEDITION';
 
 export type ThreatLevel = 'SAFE' | 'CAUTION' | 'DANGEROUS' | 'LETHAL' | 'UNKNOWN';
