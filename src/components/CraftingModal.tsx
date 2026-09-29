@@ -1,3 +1,7 @@
+/**
+ * Окно крафта: список рецептов по категориям (одежда, инструменты, укрытия, выживание),
+ * что нужно для выбранного рецепта и хватает ли ресурсов. Нажатие «Создать» передаётся в App.tsx.
+ */
 import React, { useState } from 'react';
 import { CraftingRecipe, EquippedGear, ResourceItem } from '../types/game';
 import { CRAFTING_RECIPES } from '../utils/craftingData';

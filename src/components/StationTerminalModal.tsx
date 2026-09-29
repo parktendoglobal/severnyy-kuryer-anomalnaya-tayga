@@ -1,3 +1,7 @@
+/**
+ * Терминал станции: открывается у станции (сам, если это цель текущего заказа, или по кнопке/клавише E).
+ * Здесь сдают заказ, отдыхают (все показатели до 100%) и пополняют инструменты.
+ */
 import React from 'react';
 import { Station, DeliveryMission, CargoItem, ToolItem } from '../types/game';
 import { X, CheckCircle2, Flame, Shield, Battery, Coffee, PackageCheck, Sparkles } from 'lucide-react';

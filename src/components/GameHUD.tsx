@@ -1,3 +1,9 @@
+/**
+ * HUD — всё, что постоянно висит поверх мира: шкалы выносливости, тепла, заряда и обуви,
+ * индикатор баланса груза, погода и лайки, кнопки крафта/груза/КПК/дневника/меню, панель инструментов,
+ * подсказки «поговорить / собрать / войти на станцию» и ползунок масштаба.
+ * Сам ничего не считает в игре: только показывает то, что ему передаёт App.tsx (обновляется до 10 раз в секунду).
+ */
 import React from 'react';
 import {
   PlayerStats,
@@ -11,6 +17,7 @@ import {
   PlacedStructure
 } from '../types/game';
 import {
+  Settings,
   Volume2,
   VolumeX,
   MapPin,
@@ -33,6 +40,7 @@ import {
   BookOpen
 } from 'lucide-react';
 import { STATIONS } from '../utils/constants';
+import { SHELTER_WARMTH_RADIUS, CAMPFIRE_WARMTH_RADIUS } from '../game/playerPhysics';
 
 interface GameHUDProps {
   player: PlayerStats;
@@ -50,6 +58,7 @@ interface GameHUDProps {
   zoom?: number;
   onChangeZoom?: (zoom: number) => void;
   onToggleMute: () => void;
+  onOpenMenu: () => void;
   onOpenPDA: (tab?: 'MAP' | 'MISSIONS' | 'NETWORK' | 'JOURNAL' | 'HANDBOOK') => void;
   onOpenCargo: () => void;
   onOpenCrafting: () => void;
@@ -75,6 +84,7 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   zoom = 1.0,
   onChangeZoom,
   onToggleMute,
+  onOpenMenu,
   onOpenPDA,
   onOpenCargo,
   onOpenCrafting,
@@ -83,46 +93,51 @@ export const GameHUD: React.FC<GameHUDProps> = ({
   onOpenStation,
   onUseTool
 }) => {
-  // Target station lookup if active mission
+  // Станция назначения текущего заказа и расстояние до неё. На экране расстояние в «метрах»:
+  // условно 1 клетка карты = 10 метров.
   const targetStation = activeMission ? STATIONS.find(s => s.id === activeMission.targetStationId) : null;
   const distanceToTarget = targetStation
     ? Math.round(Math.hypot(targetStation.x - player.x, targetStation.y - player.y) * 10)
     : null;
 
-  // Stationary state & Stamina regeneration rate calculation
+  // Курьер стоит на месте, если его скорость меньше 0.05 клетки в секунду и он не падает.
   const playerSpeed = Math.hypot(player.vx, player.vy);
   const isStationary = playerSpeed < 0.05 && !player.isStumbling;
 
-  // Nearby shelter / campfire bonus
+  // Рядом палатка или костёр (те же радиусы, что и в физике курьера).
   const nearShelter = structures.some(
-    s => s.type === 'SHELTER' && Math.hypot(s.x - player.x, s.y - player.y) < 3.5
+    s => s.type === 'SHELTER' && Math.hypot(s.x - player.x, s.y - player.y) < SHELTER_WARMTH_RADIUS
   );
   const nearCampfire = structures.some(
-    s => s.type === 'CAMPFIRE' && Math.hypot(s.x - player.x, s.y - player.y) < 2.5
+    s => s.type === 'CAMPFIRE' && Math.hypot(s.x - player.x, s.y - player.y) < CAMPFIRE_WARMTH_RADIUS
   );
 
-  // Recovery rate in %/sec
+  // Скорость отдыха стоя, в % выносливости в секунду — для подписи «+12/с» на шкале.
+  // Числа повторяют playerPhysics.ts: отдых стоя +12, палатка ещё +18 (итого 30),
+  // костёр ещё +10 (итого 22); при переохлаждении (тепло ниже 25) −2.5.
   const isHypothermic = player.warmth < 25;
   const baseRegenRate = nearShelter ? 30 : nearCampfire ? 22 : 12;
   const effectiveRegenRate = Math.max(1, isHypothermic ? baseRegenRate - 2.5 : baseRegenRate);
 
-  // Is stamina actively recovering while stationary
+  // Идёт ли сейчас восстановление (стоит и выносливость не полная) или курьер полностью отдохнул.
   const maxStamina = player.maxStamina || 100;
   const isStaminaRecovering = isStationary && player.stamina < maxStamina;
   const isFullyRested = isStationary && player.stamina >= maxStamina;
 
-  // Pulse animation period in seconds: faster pulse for higher regeneration rate
-  // e.g. 30%/s -> 0.52s, 22%/s -> 0.70s, 12%/s -> 1.15s, 9.5%/s -> 1.45s
+  // Период пульсации значка отдыха, в секундах: чем быстрее отдых, тем чаще пульс.
+  // 14 / скорость, но в пределах 0.45–2 с. Например: 30%/с → 0.47 с, 22%/с → 0.64 с, 12%/с → 1.17 с.
   const pulseDurationSec = Math.max(0.45, Math.min(2.0, 14 / effectiveRegenRate)).toFixed(2);
 
-  // Total weight carried
+  // Полный вес: груз + инструменты + ресурсы, округлён до 0.1 кг. 45 кг — рекомендуемый предел,
+  // он только показывается в подписи «Вес: X / 45 кг». Жёсткого запрета нет: в физике скорость
+  // падает с весом плавно (см. playerPhysics.ts).
   const totalCargoWeight = cargo.reduce((acc, c) => acc + c.weightKg, 0);
   const totalToolsWeight = tools.reduce((acc, t) => acc + t.weightKg * t.count, 0);
   const totalResourceWeight = resources.reduce((acc, r) => acc + r.weightKg * r.count, 0);
   const totalWeight = Math.round((totalCargoWeight + totalToolsWeight + totalResourceWeight) * 10) / 10;
   const maxWeight = 45.0;
 
-  // Average cargo integrity
+  // Средняя целостность груза в процентах (пустой рюкзак считается целым).
   const avgIntegrity = cargo.length > 0
     ? Math.round(cargo.reduce((acc, c) => acc + c.currentIntegrity, 0) / cargo.length)
     : 100;
@@ -419,6 +434,17 @@ export const GameHUD: React.FC<GameHUDProps> = ({
                 title={isMuted ? 'Включить звук' : 'Выключить звук'}
               >
                 {isMuted ? <VolumeX className="w-4 h-4 text-red-400" /> : <Volume2 className="w-4 h-4 text-emerald-400" />}
+              </button>
+
+              {/* Меню игры: сохранение и «Начать заново» */}
+              <button
+                id="btn-open-game-menu"
+                type="button"
+                onClick={onOpenMenu}
+                className="p-1.5 rounded-md bg-neutral-900 border border-neutral-700 text-neutral-300 hover:text-neutral-100 hover:bg-neutral-800 transition-colors"
+                title="Меню игры"
+              >
+                <Settings className="w-4 h-4 text-neutral-300" />
               </button>
             </div>
 

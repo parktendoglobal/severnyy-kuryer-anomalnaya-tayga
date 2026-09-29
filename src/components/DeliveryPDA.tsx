@@ -1,3 +1,8 @@
+/**
+ * КПК курьера — большое окно с вкладками: карта мира со станциями и курьером, список заказов,
+ * состояние сети «Евразия», дневник исследователя и справочник.
+ * Отсюда игрок берёт новые заказы на доставку.
+ */
 import React, { useState } from 'react';
 import {
   Station,
@@ -23,7 +28,7 @@ import {
 } from 'lucide-react';
 import { STATIONS } from '../utils/constants';
 import { ExplorersJournalView } from './ExplorersJournalView';
-import { JOURNAL_ENTRIES } from '../utils/journalData';
+import { JournalEntry } from '../types/journal';
 
 interface DeliveryPDAProps {
   initialTab?: 'MAP' | 'MISSIONS' | 'NETWORK' | 'JOURNAL' | 'HANDBOOK';
@@ -33,6 +38,7 @@ interface DeliveryPDAProps {
   structures: PlacedStructure[];
   activeMission: DeliveryMission | null;
   discoveredRegionIds?: string[];
+  journalEntries: JournalEntry[]; // записи дневника из уже загруженных регионов
   onAcceptMission: (missionId: string) => void;
   onClose: () => void;
 }
@@ -45,6 +51,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
   structures,
   activeMission,
   discoveredRegionIds = ['region_basin'],
+  journalEntries,
   onAcceptMission,
   onClose
 }) => {
@@ -54,7 +61,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
   const networkPercent = Math.round((connectedCount / stations.length) * 100);
 
   const regionSet = new Set(discoveredRegionIds);
-  const unlockedLoreCount = JOURNAL_ENTRIES.filter(e => regionSet.has(e.regionId)).length;
+  const unlockedLoreCount = journalEntries.filter(e => regionSet.has(e.regionId)).length;
 
   return (
     <div className="fixed inset-0 bg-neutral-950/80 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-6 select-none animate-in fade-in duration-200">
@@ -141,7 +148,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
             <Compass className="w-3.5 h-3.5 text-emerald-400" />
             <span>ДНЕВНИК ИССЛЕДОВАТЕЛЯ</span>
             <span className="text-[10px] px-1.5 py-0.2 rounded bg-neutral-900 text-emerald-400 border border-emerald-700/60 font-mono">
-              {unlockedLoreCount}/{JOURNAL_ENTRIES.length}
+              {unlockedLoreCount}/{journalEntries.length}
             </span>
           </button>
 
@@ -183,7 +190,9 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
                     }}
                   />
 
-                  {/* River representation */}
+                  {/* Схема реки. viewBox 0 0 120 120 совпадает с размером карты в клетках,
+                      поэтому координаты станций и курьера можно ставить сюда как есть.
+                      Линия реки нарисована приблизительно, по форме настоящего русла. */}
                   <svg className="absolute inset-0 w-full h-full pointer-events-none" viewBox="0 0 120 120">
                     <path
                       d="M 45,0 Q 55,30 40,60 T 48,120"
@@ -566,6 +575,7 @@ export const DeliveryPDA: React.FC<DeliveryPDAProps> = ({
             <ExplorersJournalView
               player={player}
               discoveredRegionIds={discoveredRegionIds}
+              journalEntries={journalEntries}
               onSwitchToMapTab={() => setActiveTab('MAP')}
             />
           )}

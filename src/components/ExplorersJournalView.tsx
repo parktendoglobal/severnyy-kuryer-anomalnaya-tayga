@@ -1,6 +1,11 @@
+/**
+ * Вкладка «Дневник исследователя» в КПК: список записей о регионах, аномалиях и экспедициях
+ * с поиском и фильтрами, и подробная карточка выбранной записи. Записи региона открываются,
+ * когда курьер впервые в него входит; записи ещё не открытых регионов показаны под замком.
+ */
 import React, { useState, useMemo, useEffect, useRef } from 'react';
 import { JournalEntry, JournalCategory } from '../types/journal';
-import { JOURNAL_ENTRIES, REGIONS, getRegionAt } from '../utils/journalData';
+import { REGIONS, getRegionAt } from '../content/regionMap';
 import { PlayerStats } from '../types/game';
 import { sound } from '../utils/audio';
 import {
@@ -31,12 +36,15 @@ import {
 interface ExplorersJournalViewProps {
   player: PlayerStats;
   discoveredRegionIds: string[];
+  // Записи дневника из уже загруженных регионов (регионы подгружаются по мере путешествия).
+  journalEntries: JournalEntry[];
   onSwitchToMapTab?: () => void;
 }
 
 export const ExplorersJournalView: React.FC<ExplorersJournalViewProps> = ({
   player,
   discoveredRegionIds,
+  journalEntries,
   onSwitchToMapTab
 }) => {
   const [selectedCategory, setSelectedCategory] = useState<JournalCategory | 'ALL'>('ALL');
@@ -52,7 +60,7 @@ export const ExplorersJournalView: React.FC<ExplorersJournalViewProps> = ({
 
   // Filtered entries based on category, region, and search query
   const filteredEntries = useMemo(() => {
-    return JOURNAL_ENTRIES.filter(entry => {
+    return journalEntries.filter(entry => {
       // Category filter
       if (selectedCategory !== 'ALL' && entry.category !== selectedCategory) {
         return false;
@@ -74,27 +82,28 @@ export const ExplorersJournalView: React.FC<ExplorersJournalViewProps> = ({
       }
       return true;
     });
-  }, [selectedCategory, selectedRegionFilter, searchQuery]);
+  }, [journalEntries, selectedCategory, selectedRegionFilter, searchQuery]);
 
   // Selected entry state: defaults to first unlocked entry, or first entry
   const [selectedEntryId, setSelectedEntryId] = useState<string>(() => {
-    const firstUnlocked = JOURNAL_ENTRIES.find(e => unlockedSet.has(e.regionId));
-    return firstUnlocked ? firstUnlocked.id : JOURNAL_ENTRIES[0].id;
+    const firstUnlocked = journalEntries.find(e => unlockedSet.has(e.regionId));
+    return firstUnlocked ? firstUnlocked.id : journalEntries[0]?.id ?? '';
   });
 
   const selectedEntry = useMemo(() => {
-    return JOURNAL_ENTRIES.find(e => e.id === selectedEntryId) || JOURNAL_ENTRIES[0];
-  }, [selectedEntryId]);
+    return journalEntries.find(e => e.id === selectedEntryId) || journalEntries[0];
+  }, [journalEntries, selectedEntryId]);
 
   const isSelectedUnlocked = selectedEntry ? unlockedSet.has(selectedEntry.regionId) : false;
 
-  // Unlocked count stats
-  const totalEntries = JOURNAL_ENTRIES.length;
-  const unlockedCount = JOURNAL_ENTRIES.filter(e => unlockedSet.has(e.regionId)).length;
-  const progressPercent = Math.round((unlockedCount / totalEntries) * 100);
+  // Счётчики. Записи известны только для загруженных регионов, поэтому прогресс исследования
+  // считаем по регионам: их полный список известен всегда.
+  const totalEntries = journalEntries.length;
+  const unlockedCount = journalEntries.filter(e => unlockedSet.has(e.regionId)).length;
 
   const totalRegions = REGIONS.length;
   const exploredRegionsCount = REGIONS.filter(r => unlockedSet.has(r.id)).length;
+  const progressPercent = Math.round((exploredRegionsCount / totalRegions) * 100);
 
   // Helper for rendering entry category icon
   const renderIcon = (name: JournalEntry['iconName'], className: string = 'w-4 h-4') => {
@@ -173,6 +182,15 @@ export const ExplorersJournalView: React.FC<ExplorersJournalViewProps> = ({
     };
   }, []);
 
+  // Записи стартового региона ещё загружаются (доли секунды после запуска игры).
+  if (!selectedEntry) {
+    return (
+      <div className="bg-neutral-950 border border-neutral-800 rounded-xl p-6 text-center text-xs text-neutral-500 font-mono-tech">
+        Загрузка записей дневника…
+      </div>
+    );
+  }
+
   return (
     <div className="flex flex-col gap-3 font-mono-tech select-none">
       {/* Top Banner: Exploration stats and current sector */}
@@ -207,7 +225,7 @@ export const ExplorersJournalView: React.FC<ExplorersJournalViewProps> = ({
             <span className="text-neutral-300 flex items-center gap-1.5">
               <span>ИССЛЕДОВАНИЕ ЗОНЫ СДВИГА:</span>
               <span className="text-emerald-400 font-bold">
-                {unlockedCount} из {totalEntries} записей ({progressPercent}%)
+                {unlockedCount} записей открыто ({progressPercent}% регионов)
               </span>
             </span>
             <span className="text-neutral-400">

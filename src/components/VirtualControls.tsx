@@ -1,3 +1,11 @@
+/**
+ * Экранное управление для телефона и клавиатура для компьютера: джойстик движения, кнопки лямок
+ * [Л]/[П] для удержания баланса, сканер «Эхо-4», задержка дыхания и рывок.
+ * Клавиши: WASD или стрелки — движение, Q/E — левая/правая лямка, F или пробел — сканер,
+ * C — задержать дыхание, Shift — рывок. Учтите: E и F заодно обрабатываются в App.tsx
+ * (разговор/станция и сбор ресурса), поэтому рядом с NPC или ресурсом одно нажатие делает оба дела.
+ * Компонент только сообщает App.tsx, что нажато; что из этого следует, решает игра.
+ */
 import React, { useState, useRef, useEffect, useCallback } from 'react';
 import { Radio, Wind, Sparkles, Footprints, ShieldAlert } from 'lucide-react';
 
@@ -41,6 +49,9 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
     const centerX = rect.left + rect.width / 2;
     const centerY = rect.top + rect.height / 2;
 
+    // Насколько далеко можно оттянуть ручку джойстика: радиус круга минус 14 пикселей,
+    // чтобы ручка не вылезала за край. Отклонение делится на этот радиус и превращается
+    // в силу от 0 до 1 — столько и передаётся игре.
     const maxRadius = rect.width / 2 - 14;
     let dx = clientX - centerX;
     let dy = clientY - centerY;
@@ -135,6 +146,8 @@ export const VirtualControls: React.FC<VirtualControlsProps> = ({
       if (keysDown.has('KeyA') || keysDown.has('ArrowLeft')) dx -= 1;
       if (keysDown.has('KeyD') || keysDown.has('ArrowRight')) dx += 1;
 
+      // По диагонали две клавиши сразу дали бы скорость в 1.41 раза больше. Умножаем на
+      // 0.7071 (= 1/√2), чтобы по диагонали курьер шёл с той же скоростью, что и прямо.
       if (dx !== 0 && dy !== 0) {
         dx *= 0.7071;
         dy *= 0.7071;
