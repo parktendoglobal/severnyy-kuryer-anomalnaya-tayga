@@ -140,6 +140,25 @@ export function saveGame(data: Omit<SaveData, 'version' | 'savedAt'>): boolean {
   }
 }
 
+// Сохранение как есть, строкой JSON. Нужно площадкам (Telegram, VK), чтобы держать копию в облаке.
+export function readRawSave(): string | null {
+  try {
+    return localStorage.getItem(SAVE_KEY);
+  } catch {
+    return null;
+  }
+}
+
+// Положить в память браузера сохранение, пришедшее из облака. Вызывается до первого loadGame().
+export function writeRawSave(raw: string): void {
+  try {
+    localStorage.setItem(SAVE_KEY, raw);
+    cachedLoadResult = null;
+  } catch {
+    // память браузера недоступна — играем с тем, что есть
+  }
+}
+
 // Стереть сохранение (кнопка «Начать заново»).
 export function deleteSave(): void {
   try {

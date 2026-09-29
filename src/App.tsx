@@ -54,8 +54,10 @@ import {
   SaveData,
   NPCRelation,
   SAVE_VERSION,
-  AUTOSAVE_INTERVAL_MS
+  AUTOSAVE_INTERVAL_MS,
+  readRawSave
 } from './game/saveSystem';
+import { usePlatform } from './platform';
 import { REGIONS, getRegionAt } from './content/regionMap';
 import { loadRegion, regionsNearPoint } from './content/regionLoader';
 import { sound } from './utils/audio';
@@ -150,6 +152,8 @@ export default function App() {
   // ======================================================================
   // ЗАГРУЗКА СОХРАНЕНИЯ (один раз при запуске)
   // ======================================================================
+  // Площадка (браузер, Telegram, VK, MAX). Облачную копию сохранения main.tsx уже подтянул.
+  const platform = usePlatform();
   const [boot] = useState(() => loadGame());
   const [initial] = useState(() => createInitialState(boot.kind === 'ok' ? boot.data : null));
 
@@ -461,11 +465,14 @@ export default function App() {
     });
     if (ok) {
       setLastSavedAt(new Date());
+      // Копия в облако площадки (Telegram, VK), чтобы прогресс был и на других устройствах
+      const raw = readRawSave();
+      if (raw) platform.pushSave(raw);
     } else {
       setSaveNotice('Не удалось сохранить игру: браузер не даёт записать данные (возможно, закончилось место или включён приватный режим).');
     }
     return ok;
-  }, []);
+  }, [platform]);
 
   // Автосохранение каждые 30 секунд, а также когда игрок сворачивает или закрывает вкладку.
   useEffect(() => {
@@ -488,10 +495,12 @@ export default function App() {
   }, [persistGame]);
 
   // «Начать заново» (уже подтверждено игроком в меню): стираем сохранение и перезапускаем страницу.
-  const handleRestartGame = () => {
+  const handleRestartGame = async () => {
     // Запрещаем сохранение, иначе сохранение при закрытии страницы записало бы прогресс обратно.
     savingDisabledRef.current = true;
     deleteSave();
+    // Стираем и облачную копию, иначе после перезапуска она вернула бы старый прогресс
+    await platform.clearSave().catch(() => {});
     window.location.reload();
   };
 
